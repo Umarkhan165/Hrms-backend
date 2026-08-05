@@ -1,6 +1,12 @@
-const { PrismaClient } = require('@prisma/client');
+// src/config/db.js
+const { PrismaClient } = require("@prisma/client");
 
-// Single shared Prisma client instance for the whole app.
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({
+  log: [{ emit: "event", level: "query" }],
+});
+
+prisma.$on("query", (e) => {
+  console.log(`[PRISMA] ${e.duration}ms :: ${e.query}`);
+});
 
 module.exports = prisma;
