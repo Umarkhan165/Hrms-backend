@@ -1,0 +1,5806 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+config/
+  db.js
+controllers/
+  attendance.controller.js
+  audit.controller.js
+  auth.controller.js
+  department.controller.js
+  employee.controller.js
+  goal.controller.js
+  hrDashboard.controller.js
+  leave.controller.js
+  notification.controller.js
+  rbac.controller.js
+  review.controller.js
+  team.controller.js
+  user.controller.js
+middleware/
+  audit.js
+  auth.js
+  errorHandler.js
+  validate.js
+routes/
+  attendance.routes.js
+  audit.routes.js
+  auth.routes.js
+  department.routes.js
+  employee.routes.js
+  goal.routes.js
+  hrDashboard.routes.js
+  index.js
+  leave.routes.js
+  notification.routes.js
+  profile.routes.js
+  rbac.routes.js
+  review.routes.js
+  session.routes.js
+  team.routes.js
+  user.routes.js
+utils/
+  ApiError.js
+  asyncHandler.js
+  mailer.js
+  pagination.js
+  tokens.js
+app.js
+repomix.txt
+server.js
+testMail.js
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="config/db.js">
+const { PrismaClient } = require('@prisma/client');
+
+// Single shared Prisma client instance for the whole app.
+const prisma = new PrismaClient();
+
+module.exports = prisma;
+</file>
+
+<file path="controllers/attendance.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+
+const LATE_CUTOFF_HOUR = 9; // after 9:00 the clock-in is marked 'Late'
+
+const todayDateOnly = () => {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+const getEmployeeIdForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, 'This user has no employee profile');
+  return employee.id;
+};
+
+
+// POST /attendance/clock-in
+
+const clockIn = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+  const now = new Date();
+
+  const existing = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+  });
+  if (existing) throw new ApiError(409, 'Already clocked in for today');
+
+  const status = now.getUTCHours() >= LATE_CUTOFF_HOUR ? 'LATE' : 'PRESENT';
+
+  const attendance = await prisma.attendance.create({
+    data: { employeeId, attendanceDate, clockIn: now, status },
+  });
+
+  res.status(201).json({ success: true, data: attendance });
+});
+
+
+// POST /attendance/clock-out
+
+const clockOut = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+
+  const attendance = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+    include: { breaks: true },
+  });
+  if (!attendance) throw new ApiError(400, 'You have not clocked in today');
+  if (attendance.clockOut) throw new ApiError(409, 'Already clocked out for today');
+
+  const openBreak = attendance.breaks.find((b) => !b.endTime);
+  if (openBreak) throw new ApiError(400, 'End your active break before clocking out');
+
+  const now = new Date();
+  const grossMinutes = (now - attendance.clockIn) / 60000;
+  const breakMinutes = attendance.breaks.reduce((sum, b) => sum + (b.durationMinutes || 0), 0);
+  const totalHours = Math.max(0, (grossMinutes - breakMinutes) / 60);
+
+  const updated = await prisma.attendance.update({
+    where: { id: attendance.id },
+    data: { clockOut: now, totalHours: totalHours.toFixed(2) },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+
+// POST /attendance/breaks/start
+
+const startBreak = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+
+  const attendance = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+    include: { breaks: true },
+  });
+  if (!attendance) throw new ApiError(400, 'Clock in before starting a break');
+  if (attendance.clockOut) throw new ApiError(400, 'You have already clocked out today');
+  if (attendance.breaks.some((b) => !b.endTime)) throw new ApiError(409, 'A break is already in progress');
+
+  const brk = await prisma.attendanceBreak.create({
+    data: { attendanceId: attendance.id, startTime: new Date() },
+  });
+
+  res.status(201).json({ success: true, data: brk });
+});
+
+
+// POST /attendance/breaks/end
+
+const endBreak = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+
+  const attendance = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+    include: { breaks: true },
+  });
+  if (!attendance) throw new ApiError(400, 'No attendance record for today');
+
+  const openBreak = attendance.breaks.find((b) => !b.endTime);
+  if (!openBreak) throw new ApiError(400, 'No break in progress');
+
+  const now = new Date();
+  const durationMinutes = Math.round((now - openBreak.startTime) / 60000);
+
+  const updated = await prisma.attendanceBreak.update({
+    where: { id: openBreak.id },
+    data: { endTime: now, durationMinutes },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+
+// GET /attendance  - history, paginated/filterable/sortable.
+// Employees see only their own; managers/HR/admin can pass employeeId.
+
+const listAttendance = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['attendanceDate', 'createdAt'], 'attendanceDate');
+  const { from, to, status, employeeId } = req.query;
+
+  let targetEmployeeId = employeeId;
+  if (req.user.role === 'EMPLOYEE') {
+    targetEmployeeId = await getEmployeeIdForUser(req.user.id);
+  } else if (!targetEmployeeId) {
+    targetEmployeeId = req.user.employee ? req.user.employee.id : undefined;
+  }
+
+  const where = {
+    ...(targetEmployeeId ? { employeeId: targetEmployeeId } : {}),
+    ...(status ? { status } : {}),
+    ...(from || to
+      ? {
+          attendanceDate: {
+            ...(from ? { gte: new Date(from) } : {}),
+            ...(to ? { lte: new Date(to) } : {}),
+          },
+        }
+      : {}),
+  };
+
+  const [total, records] = await Promise.all([
+    prisma.attendance.count({ where }),
+    prisma.attendance.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: { breaks: true },
+    }),
+  ]);
+
+  res.json({ success: true, data: records, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+module.exports = { clockIn, clockOut, startBreak, endBreak, listAttendance };
+</file>
+
+<file path="controllers/audit.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const { getPagination, getSort } = require("../utils/pagination");
+
+// GET /audit-logs  - HR/Admin only, filterable
+const listAuditLogs = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ["createdAt"], "createdAt");
+  const { module, userId, action } = req.query;
+
+  const where = {
+    ...(module ? { module } : {}),
+    ...(userId ? { userId } : {}),
+    ...(action ? { action: { contains: action, mode: "insensitive" } } : {}),
+  };
+
+  const [total, logs] = await Promise.all([
+    prisma.auditLog.count({ where }),
+    prisma.auditLog.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: { user: { select: { fullName: true, email: true } } },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: logs,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+module.exports = { listAuditLogs };
+</file>
+
+<file path="controllers/auth.controller.js">
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const {
+  signAccessToken,
+  signRefreshToken,
+  expiryToDate,
+} = require("../utils/tokens");
+const { sendMail } = require("../utils/mailer");
+const { writeAudit } = require("../middleware/audit");
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax",
+};
+
+// POST /auth/login
+const login = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    throw new ApiError(400, "Email and password are required");
+
+  const user = await prisma.user.findUnique({
+    where: { email: email.toLowerCase() },
+  });
+  if (!user || user.deletedAt) throw new ApiError(401, "Invalid credentials");
+  if (!user.isActive) throw new ApiError(403, "Account has been deactivated");
+  if (!user.isVerified || !user.passwordHash) {
+    throw new ApiError(
+      403,
+      "Account not activated yet - please check your onboarding email",
+    );
+  }
+
+  const valid = await bcrypt.compare(password, user.passwordHash);
+  if (!valid) throw new ApiError(401, "Invalid credentials");
+
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
+
+  await prisma.session.create({
+    data: {
+      userId: user.id,
+      refreshToken,
+      ipAddress: req.ip,
+      deviceInfo: req.headers["user-agent"] || null,
+      expiresAt: expiryToDate(process.env.REFRESH_TOKEN_EXPIRY),
+    },
+  });
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { lastLogin: new Date() },
+  });
+
+  res.cookie("refreshToken", refreshToken, cookieOptions);
+  res.json({
+    success: true,
+    data: {
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.fullName,
+        role: user.role,
+      },
+    },
+  });
+});
+// POST /auth/activate
+// Activate account + save document URLs
+
+const activate = asyncHandler(async (req, res) => {
+  const { token, password, documents = [] } = req.body;
+
+  if (!token || !password) {
+    throw new ApiError(400, "Token and password are required");
+  }
+
+  if (password.length < 8) {
+    throw new ApiError(400, "Password must be at least 8 characters");
+  }
+
+  const user = await prisma.user.findUnique({
+    where: {
+      activationToken: token,
+    },
+  });
+
+  if (!user) {
+    throw new ApiError(400, "Invalid activation token");
+  }
+
+  if (user.activationTokenExpiry && user.activationTokenExpiry < new Date()) {
+    throw new ApiError(400, "Activation token expired");
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  const result = await prisma.$transaction(async (tx) => {
+    const updatedUser = await prisma.user.update({
+      where: {
+        id: user.id,
+      },
+      data: {
+        passwordHash: passwordHash,
+
+        isActive: true,
+
+        isVerified: true,
+
+        activationToken: null,
+
+        activationTokenExpiry: null,
+      },
+    });
+
+    const employee = await tx.employee.findUnique({
+      where: {
+        userId: user.id,
+      },
+    });
+
+    if (!employee) {
+      throw new ApiError(404, "Employee profile not found");
+    }
+
+    await tx.employee.update({
+      where: {
+        id: employee.id,
+      },
+
+      data: {
+        status: "ACTIVE",
+      },
+    });
+
+    if (documents.length > 0) {
+      await tx.employeeDocument.createMany({
+        data: documents.map((doc) => ({
+          employeeId: employee.id,
+
+          docType: doc.docType,
+
+          fileUrl: doc.fileUrl,
+        })),
+      });
+    }
+
+    return {
+      employeeId: employee.id,
+      userId: updatedUser.id,
+    };
+  });
+
+  await writeAudit({
+    userId: user.id,
+
+    action: "ACCOUNT_ACTIVATED",
+
+    module: "Employees",
+
+    newData: result,
+  });
+
+  res.json({
+    success: true,
+
+    message: "Account activated successfully",
+  });
+});
+
+// POST /auth/refresh
+const refresh = asyncHandler(async (req, res) => {
+  const token = req.body.refreshToken || req.cookies?.refreshToken;
+  if (!token) throw new ApiError(401, "Refresh token missing");
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET);
+  } catch {
+    throw new ApiError(401, "Invalid or expired refresh token");
+  }
+
+  const session = await prisma.session.findFirst({
+    where: { userId: decoded.id, refreshToken: token },
+  });
+  if (!session || session.expiresAt < new Date())
+    throw new ApiError(401, "Session expired, please log in again");
+
+  const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+  if (!user || !user.isActive || user.deletedAt)
+    throw new ApiError(401, "User not found or inactive");
+
+  const accessToken = signAccessToken(user);
+  res.json({ success: true, data: { accessToken } });
+});
+
+// POST /auth/logout
+const logout = asyncHandler(async (req, res) => {
+  const token = req.body.refreshToken || req.cookies?.refreshToken;
+  if (token)
+    await prisma.session.deleteMany({ where: { refreshToken: token } });
+  res.clearCookie("refreshToken", cookieOptions);
+  res.json({ success: true, message: "Logged out" });
+});
+
+// GET /auth/me
+const me = asyncHandler(async (req, res) => {
+  const { passwordHash, activationToken, ...safeUser } = req.user;
+  res.json({ success: true, data: safeUser });
+});
+
+// DELETE /sessions/:id
+const revokeSession = asyncHandler(async (req, res) => {
+  const session = await prisma.session.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!session) throw new ApiError(404, "Session not found");
+  if (session.userId !== req.user.id && req.user.role !== "ADMIN") {
+    throw new ApiError(403, "Not allowed to revoke this session");
+  }
+  await prisma.session.delete({ where: { id: session.id } });
+  res.json({ success: true, message: "Session revoked" });
+});
+// Show my sessions
+const listMySessions = asyncHandler(async (req, res) => {
+  const sessions = await prisma.session.findMany({
+    where: { userId: req.user.id },
+    select: {
+      id: true,
+      ipAddress: true,
+      deviceInfo: true,
+      expiresAt: true,
+      createdAt: true,
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json({ success: true, data: sessions });
+});
+
+module.exports = {
+  login,
+  activate,
+  refresh,
+  logout,
+  me,
+  revokeSession,
+  listMySessions,
+  _internal: { sendMail, crypto },
+};
+</file>
+
+<file path="controllers/department.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+const createDepartment = asyncHandler(async (req, res) => {
+  const { name, managerId } = req.body;
+  if (!name) throw new ApiError(400, 'name is required');
+
+  const department = await prisma.department.create({ data: { name, managerId: managerId || null } });
+  await writeAudit({ userId: req.user.id, action: 'CREATE_DEPARTMENT', module: 'Departments', newData: department });
+  res.status(201).json({ success: true, data: department });
+});
+
+const listDepartments = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['name', 'createdAt'], 'name');
+  const { search } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}),
+  };
+
+  const [total, departments] = await Promise.all([
+    prisma.department.count({ where }),
+    prisma.department.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        manager: { select: { id: true, fullName: true, email: true } },
+        _count: { select: { employees: true, teams: true } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: departments, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+const getDepartment = asyncHandler(async (req, res) => {
+  const department = await prisma.department.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    include: { manager: { select: { id: true, fullName: true } }, teams: true },
+  });
+  if (!department) throw new ApiError(404, 'Department not found');
+  res.json({ success: true, data: department });
+});
+
+const updateDepartment = asyncHandler(async (req, res) => {
+  const { name, managerId } = req.body;
+  const department = await prisma.department.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!department) throw new ApiError(404, 'Department not found');
+
+  const updated = await prisma.department.update({
+    where: { id: department.id },
+    data: { ...(name && { name }), ...(managerId !== undefined && { managerId }) },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: 'UPDATE_DEPARTMENT',
+    module: 'Departments',
+    oldData: department,
+    newData: updated,
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+const deleteDepartment = asyncHandler(async (req, res) => {
+  const department = await prisma.department.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!department) throw new ApiError(404, 'Department not found');
+
+  await prisma.department.update({ where: { id: department.id }, data: { deletedAt: new Date() } });
+  await writeAudit({ userId: req.user.id, action: 'DELETE_DEPARTMENT', module: 'Departments', oldData: department });
+
+  res.json({ success: true, message: 'Department removed' });
+});
+
+module.exports = { createDepartment, listDepartments, getDepartment, updateDepartment, deleteDepartment };
+</file>
+
+<file path="controllers/employee.controller.js">
+const crypto = require("crypto");
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const { getPagination, getSort } = require("../utils/pagination");
+const { writeAudit } = require("../middleware/audit");
+const { sendMail } = require("../utils/mailer");
+const getMyProfile = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: {
+      userId: req.user.id,
+      deletedAt: null,
+    },
+
+    include: {
+      user: {
+        select: {
+          id: true,
+          fullName: true,
+          email: true,
+          role: true,
+        },
+      },
+
+      department: true,
+
+      team: true,
+
+      manager: {
+        include: {
+          user: {
+            select: {
+              fullName: true,
+            },
+          },
+        },
+      },
+
+      documents: true,
+    },
+  });
+
+  if (!employee) {
+    throw new ApiError(404, "Employee profile not found");
+  }
+
+  res.json({
+    success: true,
+    data: employee,
+  });
+});
+
+// POST /employees/onboard  - HR creates the USERS + EMPLOYEES instance,
+// generates the activation token and emails the invite link.
+
+const onboardEmployee = asyncHandler(async (req, res) => {
+  const {
+    email,
+    fullName,
+    role = "EMPLOYEE",
+    employeeCode,
+    designation,
+    departmentId,
+    teamId,
+    managerId,
+    employmentType = "FULL_TIME",
+    salary,
+    joiningDate,
+  } = req.body;
+
+  if (!email || !fullName || !employeeCode || !designation || !joiningDate) {
+    throw new ApiError(
+      400,
+      "email, fullName, employeeCode, designation and joiningDate are required",
+    );
+  }
+
+  const existing = await prisma.user.findUnique({
+    where: {
+      email: email.toLowerCase(),
+    },
+  });
+
+  if (existing) {
+    throw new ApiError(409, "A user with this email already exists");
+  }
+
+  const activationToken = crypto.randomBytes(32).toString("hex");
+
+  const activationTokenExpiry = new Date(
+    Date.now() +
+      (Number(process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES) || 60) * 60 * 1000,
+  );
+
+  const result = await prisma.$transaction(async (tx) => {
+    const user = await tx.user.create({
+      data: {
+        email: email.toLowerCase(),
+        fullName,
+        role,
+
+        isActive: false,
+        isVerified: false,
+
+        activationToken,
+        activationTokenExpiry,
+      },
+    });
+
+    const employee = await tx.employee.create({
+      data: {
+        userId: user.id,
+
+        employeeCode,
+
+        designation,
+
+        employmentType,
+
+        salary: salary ?? null,
+
+        joiningDate: new Date(joiningDate),
+
+        status: "PENDING",
+
+        departmentId: departmentId || null,
+
+        teamId: teamId || null,
+
+        managerId: managerId || null,
+      },
+    });
+
+    return {
+      user,
+      employee,
+    };
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+
+    action: "ONBOARD_EMPLOYEE",
+
+    module: "Employees",
+
+    newData: {
+      userId: result.user.id,
+      employeeId: result.employee.id,
+    },
+  });
+  const activationLink = `${process.env.CLIENT_URL}/setup?token=${activationToken}`;
+
+  try {
+    await sendMail({
+      to: email,
+
+      subject: "Activate your HRMS Account",
+
+      html: `
+  
+      <div style="font-family:Arial">
+  
+      <h2>Welcome ${fullName}</h2>
+  
+  
+      <p>
+      Your HRMS account has been created.
+      </p>
+  
+  
+      <p>
+      Click below to activate your account:
+      </p>
+  
+  
+      <a href="${activationLink}"
+      style="
+      background:#2563eb;
+      color:white;
+      padding:12px 20px;
+      text-decoration:none;
+      border-radius:5px;
+      ">
+  
+      Activate Account
+  
+      </a>
+  
+  
+      <p>
+      This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES} minutes.
+      </p>
+  
+  
+      </div>
+  
+      `,
+    });
+  } catch (error) {
+    console.error("Onboarding email failed to send:", error.message);
+  }
+
+  res.status(201).json({
+    success: true,
+    message: "Employee onboarded successfully - activation email sent",
+    data: {
+      userId: result.user.id,
+      employeeId: result.employee.id,
+    },
+  });
+});
+// GET /employees  - directory list with pagination/filter/search/sort
+const listEmployees = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(
+    req.query,
+    ["joiningDate", "createdAt", "designation"],
+    "createdAt",
+  );
+  const { search, departmentId, teamId, status } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(departmentId ? { departmentId } : {}),
+    ...(teamId ? { teamId } : {}),
+    ...(status ? { status } : {}),
+    ...(search
+      ? {
+          OR: [
+            { designation: { contains: search, mode: "insensitive" } },
+            { employeeCode: { contains: search, mode: "insensitive" } },
+            { user: { fullName: { contains: search, mode: "insensitive" } } },
+            { user: { email: { contains: search, mode: "insensitive" } } },
+          ],
+        }
+      : {}),
+  };
+
+  const [total, employees] = await Promise.all([
+    prisma.employee.count({ where }),
+    prisma.employee.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            role: true,
+            isActive: true,
+          },
+        },
+        department: { select: { id: true, name: true } },
+        team: { select: { id: true, name: true } },
+      },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: employees,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+// GET /employees/:id
+
+const getEmployee = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    include: {
+      user: {
+        select: {
+          id: true,
+          fullName: true,
+          email: true,
+          role: true,
+          isActive: true,
+          isVerified: true,
+        },
+      },
+      department: true,
+      team: true,
+      manager: { include: { user: { select: { fullName: true } } } },
+      documents: true,
+    },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+  res.json({ success: true, data: employee });
+});
+
+// PUT /employees/:id  - update profile fields (self or HR/Admin)
+const updateEmployee = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+
+  const isSelf = employee.userId === req.user.id;
+  const isPrivileged = ["HR", "ADMIN"].includes(req.user.role);
+  if (!isSelf && !isPrivileged)
+    throw new ApiError(403, "Not allowed to update this employee");
+
+  // Self-service employees may only touch their own contact-ish fields;
+  // org placement / pay / status stays HR & Admin only.
+  const selfAllowed = ["designation"];
+  const privilegedOnly = [
+    "departmentId",
+    "teamId",
+    "managerId",
+    "employmentType",
+    "salary",
+    "status",
+  ];
+
+  const data = {};
+  for (const key of Object.keys(req.body)) {
+    if (
+      isPrivileged &&
+      (selfAllowed.includes(key) || privilegedOnly.includes(key))
+    )
+      data[key] = req.body[key];
+    else if (isSelf && selfAllowed.includes(key)) data[key] = req.body[key];
+  }
+
+  const updated = await prisma.employee.update({
+    where: { id: employee.id },
+    data,
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "UPDATE_EMPLOYEE",
+    module: "Employees",
+    oldData: employee,
+    newData: updated,
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+// DELETE /employees/:id  - soft delete (HR/Admin only)
+
+const softDeleteEmployee = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+
+  await prisma.employee.update({
+    where: { id: employee.id },
+    data: { deletedAt: new Date(), status: "TERMINATED" },
+  });
+  await prisma.user.update({
+    where: { id: employee.userId },
+    data: { deletedAt: new Date(), isActive: false },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "DELETE_EMPLOYEE",
+    module: "Employees",
+    oldData: employee,
+  });
+
+  res.json({ success: true, message: "Employee removed" });
+});
+
+// POST /employees/:id/documents  - record an uploaded personal/tax document
+// (expects the file to already be uploaded to storage; this just stores the URL)
+
+const addDocument = asyncHandler(async (req, res) => {
+  const { docType, fileUrl } = req.body;
+  if (!docType || !fileUrl)
+    throw new ApiError(400, "docType and fileUrl are required");
+
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+  if (
+    employee.userId !== req.user.id &&
+    !["HR", "ADMIN"].includes(req.user.role)
+  ) {
+    throw new ApiError(
+      403,
+      "Not allowed to upload documents for this employee",
+    );
+  }
+
+  const doc = await prisma.employeeDocument.create({
+    data: { employeeId: employee.id, docType, fileUrl },
+  });
+
+  res.status(201).json({ success: true, data: doc });
+});
+
+module.exports = {
+  onboardEmployee,
+  listEmployees,
+  getEmployee,
+  updateEmployee,
+  softDeleteEmployee,
+  getMyProfile,
+  addDocument,
+};
+</file>
+
+<file path="controllers/goal.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+
+const getEmployeeForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, 'This user has no employee profile');
+  return employee;
+};
+
+const notify = (userId, type, title, message) =>
+  prisma.notification.create({ data: { userId, type, title, message } });
+
+ 
+// POST /goals  - manager assigns a goal to a direct report 
+const createGoal = asyncHandler(async (req, res) => {
+  const { employeeId, title, description, targetDate, priority = 'MEDIUM' } = req.body;
+  if (!employeeId || !title || !targetDate) throw new ApiError(400, 'employeeId, title and targetDate are required');
+
+  const creator = await getEmployeeForUser(req.user.id);
+
+  if (req.user.role === 'MANAGER') {
+    const target = await prisma.employee.findUnique({ where: { id: employeeId } });
+    if (!target || target.managerId !== creator.id) {
+      throw new ApiError(403, 'You can only assign goals to your direct reports');
+    }
+  }
+
+  const goal = await prisma.goal.create({
+    data: {
+      employeeId,
+      createdById: creator.id,
+      title,
+      description,
+      targetDate: new Date(targetDate),
+      priority,
+      status: 'NOT_STARTED',
+      progress: 0,
+    },
+  });
+
+  const target = await prisma.employee.findUnique({ where: { id: employeeId } });
+  await notify(target.userId, 'GOAL_ASSIGNED', 'New goal assigned', `A new goal "${title}" has been assigned to you.`);
+
+  res.status(201).json({ success: true, data: goal });
+});
+
+ 
+// GET /goals  - employee sees own; manager sees direct reports' 
+const listGoals = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['targetDate', 'createdAt', 'progress'], 'createdAt');
+  const { status, employeeId } = req.query;
+
+  let where = { ...(status ? { status } : {}) };
+
+  if (req.user.role === 'EMPLOYEE') {
+    const employee = await getEmployeeForUser(req.user.id);
+    where.employeeId = employee.id;
+  } else if (req.user.role === 'MANAGER' && !employeeId) {
+    const manager = await getEmployeeForUser(req.user.id);
+    where.employee = { managerId: manager.id };
+  } else if (employeeId) {
+    where.employeeId = employeeId;
+  }
+
+  const [total, goals] = await Promise.all([
+    prisma.goal.count({ where }),
+    prisma.goal.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        employee: { include: { user: { select: { fullName: true } } } },
+        updates: { orderBy: { createdAt: 'desc' } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: goals, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+const getGoal = asyncHandler(async (req, res) => {
+  const goal = await prisma.goal.findUnique({
+    where: { id: req.params.id },
+    include: { updates: { orderBy: { createdAt: 'desc' } }, employee: { include: { user: true } } },
+  });
+  if (!goal) throw new ApiError(404, 'Goal not found');
+  res.json({ success: true, data: goal });
+});
+
+ 
+// PATCH /goals/:id/progress  - employee edits percent-complete with a comment 
+const updateProgress = asyncHandler(async (req, res) => {
+  const { progress, comment } = req.body;
+  if (progress === undefined || progress < 0 || progress > 100) throw new ApiError(400, 'progress must be 0-100');
+  if (!comment) throw new ApiError(400, 'A comment is required for every progress update');
+
+  const goal = await prisma.goal.findUnique({ where: { id: req.params.id }, include: { employee: true } });
+  if (!goal) throw new ApiError(404, 'Goal not found');
+  if (goal.employee.userId !== req.user.id) throw new ApiError(403, 'You can only update your own goal progress');
+
+  const status = progress === 100 ? 'ACHIEVED' : progress > 0 ? 'IN_PROGRESS' : 'NOT_STARTED';
+
+  const [updated] = await prisma.$transaction([
+    prisma.goal.update({ where: { id: goal.id }, data: { progress, status } }),
+    prisma.goalUpdate.create({ data: { goalId: goal.id, progress, comment } }),
+  ]);
+
+  if (progress === 100) {
+    const creator = await prisma.employee.findUnique({ where: { id: goal.createdById } });
+    if (creator) {
+      await notify(
+        creator.userId,
+        'GOAL_VALIDATION',
+        'Goal ready for validation',
+        `"${goal.title}" reached 100% and needs your validation.`
+      );
+    }
+  }
+
+  res.json({ success: true, data: updated });
+});
+
+ 
+// PATCH /goals/:id/validate  - manager validates a goal at 100% progress 
+const validateGoal = asyncHandler(async (req, res) => {
+  const goal = await prisma.goal.findUnique({ where: { id: req.params.id } });
+  if (!goal) throw new ApiError(404, 'Goal not found');
+  if (goal.progress !== 100) throw new ApiError(400, 'Goal must be at 100% progress before it can be validated');
+
+  const manager = await getEmployeeForUser(req.user.id);
+  if (req.user.role === 'MANAGER' && goal.createdById !== manager.id) {
+    throw new ApiError(403, 'Only the goal creator (manager) can validate it');
+  }
+
+  const updated = await prisma.goal.update({
+    where: { id: goal.id },
+    data: { validatedAt: new Date(), status: 'ACHIEVED' },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = { createGoal, listGoals, getGoal, updateProgress, validateGoal };
+</file>
+
+<file path="controllers/hrDashboard.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+
+// GET /hr/dashboard
+
+const getHRDashboard = asyncHandler(async (req, res) => {
+  const [
+    employees,
+    pendingLeaves,
+    onboarding,
+    totalReviews,
+    completedReviews,
+    alerts,
+  ] = await Promise.all([
+    // Total active employees
+    prisma.employee.count({
+      where: {
+        deletedAt: null,
+        status: "ACTIVE",
+      },
+    }),
+
+    // Pending leave requests
+    prisma.leaveRequest.count({
+      where: {
+        status: "PENDING",
+      },
+    }),
+
+    // Pending onboarding
+    prisma.employee.count({
+      where: {
+        status: "PENDING",
+      },
+    }),
+
+    // All reviews
+    prisma.review.count(),
+
+    // Completed reviews
+    prisma.review.count({
+      where: {
+        status: {
+          in: ["SUBMITTED", "PUBLISHED", "ACKNOWLEDGED"],
+        },
+      },
+    }),
+
+    // Latest audit logs
+    prisma.auditLog.findMany({
+      take: 5,
+
+      orderBy: {
+        createdAt: "desc",
+      },
+
+      include: {
+        user: {
+          select: {
+            fullName: true,
+            email: true,
+          },
+        },
+      },
+    }),
+  ]);
+
+  const reviewProgress =
+    totalReviews > 0 ? Math.round((completedReviews / totalReviews) * 100) : 0;
+  res.json({
+    success: true,
+
+    data: {
+      totalEmployees: employees,
+
+      pendingLeaves,
+
+      onboardingEmployees: onboarding,
+
+      reviewProgress,
+
+      attendanceAlerts: 0,
+
+      latestAudit: alerts,
+    },
+  });
+});
+
+module.exports = {
+  getHRDashboard,
+};
+</file>
+
+<file path="controllers/leave.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+const getEmployeeIdForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, 'This user has no employee profile');
+  return employee;
+};
+
+const daysBetweenInclusive = (start, end) => Math.floor((end - start) / 86400000) + 1;
+
+const notify = (userId, type, title, message) =>
+  prisma.notification.create({ data: { userId, type, title, message } });
+
+ 
+// GET /leave-types 
+const listLeaveTypes = asyncHandler(async (req, res) => {
+  const leaveTypes = await prisma.leaveType.findMany({ orderBy: { name: 'asc' } });
+  res.json({ success: true, data: leaveTypes });
+});
+
+const createLeaveType = asyncHandler(async (req, res) => {
+  const { name, defaultAllocation = 0 } = req.body;
+  if (!name) throw new ApiError(400, 'name is required');
+  const leaveType = await prisma.leaveType.create({ data: { name, defaultAllocation } });
+  res.status(201).json({ success: true, data: leaveType });
+});
+
+ 
+// GET /leave-balances  - current employee's balances, or ?employeeId= for HR
+ 
+const getLeaveBalances = asyncHandler(async (req, res) => {
+  let employeeId = req.query.employeeId;
+  if (req.user.role === 'EMPLOYEE' || !employeeId) {
+    const employee = await getEmployeeIdForUser(req.user.id);
+    employeeId = employee.id;
+  }
+
+  const balances = await prisma.leaveBalance.findMany({
+    where: { employeeId },
+    include: { leaveType: true },
+  });
+
+  res.json({ success: true, data: balances });
+});
+
+ 
+// POST /leave-requests  - employee submits, validated against balance quota
+const createLeaveRequest = asyncHandler(async (req, res) => {
+  const { leaveTypeId, startDate, endDate, reason } = req.body;
+  if (!leaveTypeId || !startDate || !endDate || !reason) {
+    throw new ApiError(400, 'leaveTypeId, startDate, endDate and reason are required');
+  }
+
+  const employee = await getEmployeeIdForUser(req.user.id);
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (end < start) throw new ApiError(400, 'endDate cannot be before startDate');
+  const days = daysBetweenInclusive(start, end);
+
+  const balance = await prisma.leaveBalance.findUnique({
+    where: { employeeId_leaveTypeId: { employeeId: employee.id, leaveTypeId } },
+  });
+  if (!balance || balance.remainingDays < days) {
+    throw new ApiError(400, 'Insufficient leave balance for this request');
+  }
+
+  const leaveRequest = await prisma.leaveRequest.create({
+    data: { employeeId: employee.id, leaveTypeId, startDate: start, endDate: end, days, reason },
+  });
+
+  if (employee.managerId) {
+    const manager = await prisma.employee.findUnique({ where: { id: employee.managerId } });
+    if (manager) {
+      await notify(
+        manager.userId,
+        'LEAVE_REQUEST',
+        'New leave request',
+        `A leave request for ${days} day(s) is waiting for your review.`
+      );
+    }
+  }
+
+  res.status(201).json({ success: true, data: leaveRequest });
+});
+
+ 
+// GET /leave-requests  - employee sees own; manager sees direct reports'
+// pending-manager-review; HR sees all pending-HR / all, filterable
+ 
+const listLeaveRequests = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['requestedAt', 'startDate'], 'requestedAt');
+  const { status, employeeId } = req.query;
+
+  let where = { ...(status ? { status } : {}) };
+
+  if (req.user.role === 'EMPLOYEE') {
+    const employee = await getEmployeeIdForUser(req.user.id);
+    where.employeeId = employee.id;
+  } else if (req.user.role === 'MANAGER') {
+    const manager = await getEmployeeIdForUser(req.user.id);
+    where.employee = { managerId: manager.id };
+    if (!status) where.status = 'PENDING';
+  } else if (employeeId) {
+    where.employeeId = employeeId;
+  }
+
+  const [total, requests] = await Promise.all([
+    prisma.leaveRequest.count({ where }),
+    prisma.leaveRequest.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        leaveType: true,
+        employee: { include: { user: { select: { fullName: true, email: true } } } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: requests, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+ 
+// PUT /leave-requests/:id/manager-review  - first-gate approval
+ 
+const managerReview = asyncHandler(async (req, res) => {
+  const { decision, comment } = req.body; // decision: 'APPROVE' | 'REJECT'
+  if (!['APPROVE', 'REJECT'].includes(decision)) throw new ApiError(400, "decision must be 'APPROVE' or 'REJECT'");
+
+  const leaveRequest = await prisma.leaveRequest.findUnique({
+    where: { id: req.params.id },
+    include: { employee: true },
+  });
+  if (!leaveRequest) throw new ApiError(404, 'Leave request not found');
+  if (leaveRequest.status !== 'PENDING') throw new ApiError(400, 'This request has already moved past manager review');
+
+  const manager = await getEmployeeIdForUser(req.user.id);
+  if (req.user.role === 'MANAGER' && leaveRequest.employee.managerId !== manager.id) {
+    throw new ApiError(403, 'You can only review requests from your direct reports');
+  }
+
+  const status = decision === 'APPROVE' ? 'APPROVED_MANAGER' : 'REJECTED';
+
+  const updated = await prisma.leaveRequest.update({
+    where: { id: leaveRequest.id },
+    data: { status, managerComment: comment || null, decidedAt: decision === 'REJECT' ? new Date() : null },
+  });
+
+  await notify(
+    leaveRequest.employee.userId,
+    status === 'REJECTED' ? 'LEAVE_REJECTED' : 'LEAVE_REQUEST',
+    status === 'REJECTED' ? 'Leave request rejected' : 'Leave request approved by manager',
+    status === 'REJECTED'
+      ? `Your manager rejected your leave request. Reason: ${comment || 'No reason given'}`
+      : 'Your manager approved your leave request. It now moves to HR for final approval.'
+  );
+
+  await writeAudit({
+    userId: req.user.id,
+    action: `LEAVE_MANAGER_${decision}`,
+    module: 'Leave',
+    oldData: leaveRequest,
+    newData: updated,
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+ 
+// PUT /leave-requests/:id/hr-approve  - second-gate, atomic balance deduction
+ 
+const hrApprove = asyncHandler(async (req, res) => {
+  const { decision, comment } = req.body; // decision: 'APPROVE' | 'REJECT'
+  if (!['APPROVE', 'REJECT'].includes(decision)) throw new ApiError(400, "decision must be 'APPROVE' or 'REJECT'");
+
+  const leaveRequest = await prisma.leaveRequest.findUnique({
+    where: { id: req.params.id },
+    include: { employee: true },
+  });
+  if (!leaveRequest) throw new ApiError(404, 'Leave request not found');
+  if (leaveRequest.status !== 'APPROVED_MANAGER') {
+    throw new ApiError(400, 'This request is not awaiting HR approval');
+  }
+
+  const status = decision === 'APPROVE' ? 'APPROVED_HR' : 'REJECTED';
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const req_ = await tx.leaveRequest.update({
+      where: { id: leaveRequest.id },
+      data: { status, hrComment: comment || null, decidedAt: new Date() },
+    });
+
+    if (decision === 'APPROVE') {
+      await tx.leaveBalance.update({
+        where: { employeeId_leaveTypeId: { employeeId: leaveRequest.employeeId, leaveTypeId: leaveRequest.leaveTypeId } },
+        data: { remainingDays: { decrement: leaveRequest.days } },
+      });
+    }
+
+    await tx.auditLog.create({
+      data: {
+        userId: req.user.id,
+        action: `LEAVE_HR_${decision}`,
+        module: 'Leave',
+        oldData: leaveRequest,
+        newData: req_,
+      },
+    });
+
+    return req_;
+  });
+
+  await notify(
+    leaveRequest.employee.userId,
+    status === 'REJECTED' ? 'LEAVE_REJECTED' : 'LEAVE_APPROVED',
+    status === 'REJECTED' ? 'Leave request rejected by HR' : 'Leave request fully approved',
+    status === 'REJECTED'
+      ? `HR rejected your leave request. Reason: ${comment || 'No reason given'}`
+      : 'Your leave request has been fully approved and your balance has been updated.'
+  );
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = {
+  listLeaveTypes,
+  createLeaveType,
+  getLeaveBalances,
+  createLeaveRequest,
+  listLeaveRequests,
+  managerReview,
+  hrApprove,
+};
+</file>
+
+<file path="controllers/notification.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const { getPagination } = require("../utils/pagination");
+const { writeAudit } = require("../middleware/audit");
+
+const listNotifications = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const { unreadOnly } = req.query;
+
+  const where = {
+    userId: req.user.id,
+    ...(unreadOnly === "true" ? { read: false } : {}),
+  };
+
+  const [total, notifications] = await Promise.all([
+    prisma.notification.count({ where }),
+    prisma.notification.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: notifications,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+const markRead = asyncHandler(async (req, res) => {
+  const notification = await prisma.notification.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!notification) throw new ApiError(404, "Notification not found");
+  if (notification.userId !== req.user.id)
+    throw new ApiError(403, "Not your notification");
+
+  const updated = await prisma.notification.update({
+    where: { id: notification.id },
+    data: { read: true },
+  });
+  res.json({ success: true, data: updated });
+});
+
+// POST /notifications/broadcast  - HR/Admin sends a notification to all staff or one role
+const broadcastNotification = asyncHandler(async (req, res) => {
+  const { title, message, targetRole } = req.body;
+  if (!title || !message)
+    throw new ApiError(400, "title and message are required");
+  if (
+    targetRole &&
+    !["EMPLOYEE", "MANAGER", "HR", "ADMIN"].includes(targetRole)
+  ) {
+    throw new ApiError(400, "Invalid targetRole");
+  }
+
+  const targetUsers = await prisma.user.findMany({
+    where: {
+      deletedAt: null,
+      isActive: true,
+      ...(targetRole ? { role: targetRole } : {}),
+    },
+    select: { id: true },
+  });
+
+  if (targetUsers.length === 0)
+    throw new ApiError(400, "No matching active users to notify");
+
+  await prisma.notification.createMany({
+    data: targetUsers.map((u) => ({
+      userId: u.id,
+      type: "BROADCAST",
+      title,
+      message,
+    })),
+  });
+
+  const broadcast = await prisma.broadcast.create({
+    data: {
+      title,
+      message,
+      targetRole: targetRole || null,
+      recipientCount: targetUsers.length,
+      sentById: req.user.id,
+    },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "BROADCAST_NOTIFICATION",
+    module: "Notifications",
+    newData: broadcast,
+  });
+
+  res.status(201).json({ success: true, data: broadcast });
+});
+
+// GET /notifications/broadcasts  - HR/Admin broadcast history feed
+const listBroadcasts = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+
+  const [total, broadcasts] = await Promise.all([
+    prisma.broadcast.count(),
+    prisma.broadcast.findMany({
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: broadcasts,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+module.exports = {
+  listNotifications,
+  markRead,
+  broadcastNotification,
+  listBroadcasts,
+};
+</file>
+
+<file path="controllers/rbac.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const { getPagination, getSort } = require("../utils/pagination");
+const { writeAudit } = require("../middleware/audit");
+
+// =========================
+// ROLES
+// =========================
+
+// GET /rbac/roles
+const listRoles = asyncHandler(async (req, res) => {
+  const roles = await prisma.rbacRole.findMany({
+    orderBy: { name: "asc" },
+    include: { _count: { select: { permissions: true } } },
+  });
+  res.json({ success: true, data: roles });
+});
+
+// POST /rbac/roles
+const createRole = asyncHandler(async (req, res) => {
+  const { name, description } = req.body;
+  if (!name) throw new ApiError(400, "name is required");
+
+  const role = await prisma.rbacRole.create({
+    data: { name, description: description || null },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "CREATE_ROLE",
+    module: "RBAC",
+    newData: role,
+  });
+
+  res.status(201).json({ success: true, data: role });
+});
+
+// =========================
+// PERMISSIONS
+// =========================
+
+// GET /rbac/permissions  - filterable by module, paginated
+const listPermissions = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ["module", "name", "createdAt"], "module");
+  const { module } = req.query;
+
+  const where = { ...(module ? { module } : {}) };
+
+  const [total, permissions] = await Promise.all([
+    prisma.permission.count({ where }),
+    prisma.permission.findMany({ where, skip, take: limit, orderBy }),
+  ]);
+
+  res.json({
+    success: true,
+    data: permissions,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+// POST /rbac/permissions
+const createPermission = asyncHandler(async (req, res) => {
+  const { name, module, action } = req.body;
+  if (!name || !module || !action)
+    throw new ApiError(400, "name, module and action are required");
+  if (!["CREATE", "READ", "UPDATE", "DELETE"].includes(action))
+    throw new ApiError(400, "action must be CREATE, READ, UPDATE or DELETE");
+
+  const permission = await prisma.permission.create({
+    data: { name, module, action },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "CREATE_PERMISSION",
+    module: "RBAC",
+    newData: permission,
+  });
+
+  res.status(201).json({ success: true, data: permission });
+});
+
+// =========================
+// ROLE <-> PERMISSION ASSIGNMENT
+// =========================
+
+// GET /rbac/roles/:id/permissions  - permission ids currently assigned to a role
+const getRolePermissions = asyncHandler(async (req, res) => {
+  const role = await prisma.rbacRole.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!role) throw new ApiError(404, "Role not found");
+
+  const assignments = await prisma.rbacRolePermission.findMany({
+    where: { roleId: role.id },
+    include: { permission: true },
+  });
+
+  res.json({
+    success: true,
+    data: assignments.map((a) => a.permission),
+  });
+});
+
+// PUT /rbac/roles/:id/permissions  - body: { permissionIds: string[] }
+// Replaces the full assignment set for a role atomically.
+const setRolePermissions = asyncHandler(async (req, res) => {
+  const { permissionIds } = req.body;
+  if (!Array.isArray(permissionIds))
+    throw new ApiError(400, "permissionIds must be an array");
+
+  const role = await prisma.rbacRole.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!role) throw new ApiError(404, "Role not found");
+
+  const before = await prisma.rbacRolePermission.findMany({
+    where: { roleId: role.id },
+    select: { permissionId: true },
+  });
+
+  await prisma.$transaction(async (tx) => {
+    await tx.rbacRolePermission.deleteMany({ where: { roleId: role.id } });
+
+    if (permissionIds.length > 0) {
+      await tx.rbacRolePermission.createMany({
+        data: permissionIds.map((permissionId) => ({
+          roleId: role.id,
+          permissionId,
+        })),
+        skipDuplicates: true,
+      });
+    }
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "SET_ROLE_PERMISSIONS",
+    module: "RBAC",
+    oldData: { permissionIds: before.map((b) => b.permissionId) },
+    newData: { permissionIds },
+  });
+
+  const updated = await prisma.rbacRolePermission.findMany({
+    where: { roleId: role.id },
+    include: { permission: true },
+  });
+
+  res.json({
+    success: true,
+    data: updated.map((a) => a.permission),
+  });
+});
+
+module.exports = {
+  listRoles,
+  createRole,
+  listPermissions,
+  createPermission,
+  getRolePermissions,
+  setRolePermissions,
+};
+</file>
+
+<file path="controllers/review.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+
+const getEmployeeForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, "This user has no employee profile");
+  return employee;
+};
+
+const notify = (userId, type, title, message) =>
+  prisma.notification.create({ data: { userId, type, title, message } });
+
+// POST /review-cycles  - HR launches an evaluation period
+
+const createReviewCycle = asyncHandler(async (req, res) => {
+  const { name, startDate, endDate } = req.body;
+  if (!name || !startDate || !endDate)
+    throw new ApiError(400, "name, startDate and endDate are required");
+
+  const cycle = await prisma.reviewCycle.create({
+    data: {
+      name,
+      startDate: new Date(startDate),
+      endDate: new Date(endDate),
+      active: true,
+    },
+  });
+  res.status(201).json({ success: true, data: cycle });
+});
+
+const listReviewCycles = asyncHandler(async (req, res) => {
+  const cycles = await prisma.reviewCycle.findMany({
+    orderBy: { startDate: "desc" },
+    include: { templates: { include: { questions: true } } },
+  });
+  res.json({ success: true, data: cycles });
+});
+
+// POST /review-templates  +  POST /review-templates/:id/questions
+
+const createReviewTemplate = asyncHandler(async (req, res) => {
+  const { cycleId, name } = req.body;
+  if (!cycleId || !name)
+    throw new ApiError(400, "cycleId and name are required");
+
+  const template = await prisma.reviewTemplate.create({
+    data: { cycleId, name },
+  });
+  res.status(201).json({ success: true, data: template });
+});
+
+const addTemplateQuestion = asyncHandler(async (req, res) => {
+  const { category, text, weight = 1 } = req.body;
+  if (!category || !text)
+    throw new ApiError(400, "category and text are required");
+
+  const question = await prisma.reviewQuestion.create({
+    data: { templateId: req.params.id, category, text, weight },
+  });
+  res.status(201).json({ success: true, data: question });
+});
+
+// POST /reviews  - fires one review record for self / peer / manager track
+
+const createReview = asyncHandler(async (req, res) => {
+  const { cycleId, templateId, employeeId, reviewerId, reviewType } = req.body;
+  if (!cycleId || !templateId || !employeeId || !reviewType) {
+    throw new ApiError(
+      400,
+      "cycleId, templateId, employeeId and reviewType are required",
+    );
+  }
+  if (!["SELF", "PEER", "MANAGER"].includes(reviewType))
+    throw new ApiError(400, "Invalid reviewType");
+
+  const review = await prisma.review.create({
+    data: {
+      cycleId,
+      templateId,
+      employeeId,
+      reviewerId: reviewType === "SELF" ? employeeId : reviewerId || null,
+      reviewType,
+      status: "PENDING",
+    },
+  });
+
+  res.status(201).json({ success: true, data: review });
+});
+
+// GET /reviews  - list reviews for current user (as employee or reviewer), or all for HR
+
+const listReviews = asyncHandler(async (req, res) => {
+  const { cycleId, status, employeeId } = req.query;
+  let where = {
+    ...(cycleId ? { cycleId } : {}),
+    ...(status ? { status } : {}),
+  };
+
+  if (["HR", "ADMIN"].includes(req.user.role)) {
+    if (employeeId) where.employeeId = employeeId;
+  } else {
+    const employee = await getEmployeeForUser(req.user.id);
+    where.OR = [{ employeeId: employee.id }, { reviewerId: employee.id }];
+  }
+
+  const reviews = await prisma.review.findMany({
+    where,
+    include: {
+      template: {
+        include: {
+          questions: true,
+        },
+      },
+      employee: { include: { user: { select: { fullName: true } } } },
+      answers: true,
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  res.json({ success: true, data: reviews });
+});
+
+// POST /reviews/:id/answers  - submit answers (bulk) and mark submitted
+// body: { answers: [{ questionId, rating, comment }] }
+
+const submitAnswers = asyncHandler(async (req, res) => {
+  const { answers } = req.body;
+  if (!Array.isArray(answers) || answers.length === 0)
+    throw new ApiError(400, "answers array is required");
+
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+  if (review.status !== "PENDING")
+    throw new ApiError(400, "This review has already been submitted");
+
+  for (const a of answers) {
+    if (!a.questionId || a.rating < 1 || a.rating > 5) {
+      throw new ApiError(
+        400,
+        "Each answer needs a questionId and a rating between 1 and 5",
+      );
+    }
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.reviewAnswer.createMany({
+      data: answers.map((a) => ({
+        reviewId: review.id,
+        questionId: a.questionId,
+        rating: a.rating,
+        comment: a.comment || null,
+      })),
+    });
+
+    return tx.review.update({
+      where: { id: review.id },
+      data: {
+        status: "SUBMITTED",
+        comments: req.body.comments || null,
+        submittedAt: new Date(),
+      },
+    });
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+// GET /reviews/:id/score  - Score = sum(rating * weight) / sum(weight)
+
+const getScore = asyncHandler(async (req, res) => {
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+    include: { answers: { include: { question: true } } },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+
+  if (review.answers.length === 0) {
+    return res.json({
+      success: true,
+      data: { score: null, message: "No answers submitted yet" },
+    });
+  }
+
+  const weightedSum = review.answers.reduce(
+    (sum, a) => sum + a.rating * Number(a.question.weight),
+    0,
+  );
+  const weightTotal = review.answers.reduce(
+    (sum, a) => sum + Number(a.question.weight),
+    0,
+  );
+  const score = weightTotal > 0 ? weightedSum / weightTotal : null;
+
+  res.json({ success: true, data: { score } });
+});
+
+// PATCH /reviews/:id/publish  - HR locks in the calculated score
+
+const publishReview = asyncHandler(async (req, res) => {
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+    include: { answers: { include: { question: true } }, employee: true },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+  if (review.status !== "SUBMITTED")
+    throw new ApiError(400, "Only submitted reviews can be published");
+
+  const weightedSum = review.answers.reduce(
+    (sum, a) => sum + a.rating * Number(a.question.weight),
+    0,
+  );
+  const weightTotal = review.answers.reduce(
+    (sum, a) => sum + Number(a.question.weight),
+    0,
+  );
+  const overallScore = weightTotal > 0 ? weightedSum / weightTotal : null;
+
+  const updated = await prisma.review.update({
+    where: { id: review.id },
+    data: { status: "PUBLISHED", overallScore },
+  });
+
+  await notify(
+    review.employee.userId,
+    "REVIEW_DUE",
+    "Performance review published",
+    "Your performance review has been published. Please acknowledge it.",
+  );
+
+  res.json({ success: true, data: updated });
+});
+
+// PATCH /reviews/:id/acknowledge  - employee acknowledges the published result
+
+const acknowledgeReview = asyncHandler(async (req, res) => {
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+    include: { employee: true },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+  if (review.employee.userId !== req.user.id)
+    throw new ApiError(403, "Only the reviewed employee can acknowledge this");
+  if (review.status !== "PUBLISHED")
+    throw new ApiError(400, "Review has not been published yet");
+
+  const updated = await prisma.review.update({
+    where: { id: review.id },
+    data: { status: "ACKNOWLEDGED", acknowledgedAt: new Date() },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = {
+  createReviewCycle,
+  listReviewCycles,
+  createReviewTemplate,
+  addTemplateQuestion,
+  createReview,
+  listReviews,
+  submitAnswers,
+  getScore,
+  publishReview,
+  acknowledgeReview,
+};
+</file>
+
+<file path="controllers/team.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+const createTeam = asyncHandler(async (req, res) => {
+  const { name, departmentId, leadId } = req.body;
+  if (!name || !departmentId) throw new ApiError(400, 'name and departmentId are required');
+
+  const team = await prisma.team.create({ data: { name, departmentId, leadId: leadId || null } });
+  await writeAudit({ userId: req.user.id, action: 'CREATE_TEAM', module: 'Teams', newData: team });
+  res.status(201).json({ success: true, data: team });
+});
+
+const listTeams = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['name', 'createdAt'], 'name');
+  const { search, departmentId } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(departmentId ? { departmentId } : {}),
+    ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}),
+  };
+
+  const [total, teams] = await Promise.all([
+    prisma.team.count({ where }),
+    prisma.team.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        department: { select: { id: true, name: true } },
+        lead: { select: { id: true, fullName: true } },
+        _count: { select: { employees: true } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: teams, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+const getTeam = asyncHandler(async (req, res) => {
+  const team = await prisma.team.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    include: {
+      department: true,
+      lead: { select: { id: true, fullName: true } },
+      employees: { include: { user: { select: { fullName: true, email: true } } } },
+    },
+  });
+  if (!team) throw new ApiError(404, 'Team not found');
+  res.json({ success: true, data: team });
+});
+
+const updateTeam = asyncHandler(async (req, res) => {
+  const { name, leadId, departmentId } = req.body;
+  const team = await prisma.team.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!team) throw new ApiError(404, 'Team not found');
+
+  const updated = await prisma.team.update({
+    where: { id: team.id },
+    data: {
+      ...(name && { name }),
+      ...(leadId !== undefined && { leadId }),
+      ...(departmentId && { departmentId }),
+    },
+  });
+
+  await writeAudit({ userId: req.user.id, action: 'UPDATE_TEAM', module: 'Teams', oldData: team, newData: updated });
+  res.json({ success: true, data: updated });
+});
+
+const deleteTeam = asyncHandler(async (req, res) => {
+  const team = await prisma.team.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!team) throw new ApiError(404, 'Team not found');
+
+  await prisma.team.update({ where: { id: team.id }, data: { deletedAt: new Date() } });
+  await writeAudit({ userId: req.user.id, action: 'DELETE_TEAM', module: 'Teams', oldData: team });
+
+  res.json({ success: true, message: 'Team removed' });
+});
+
+// GET /teams/:id/attendance  - manager's "team attendance" screen
+const getTeamAttendance = asyncHandler(async (req, res) => {
+  const { date } = req.query;
+  const team = await prisma.team.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!team) throw new ApiError(404, 'Team not found');
+
+  const targetDate = date ? new Date(date) : new Date();
+  targetDate.setUTCHours(0, 0, 0, 0);
+
+  const attendance = await prisma.attendance.findMany({
+    where: { attendanceDate: targetDate, employee: { teamId: team.id } },
+    include: { employee: { include: { user: { select: { fullName: true } } } } },
+  });
+
+  res.json({ success: true, data: attendance });
+});
+
+module.exports = { createTeam, listTeams, getTeam, updateTeam, deleteTeam, getTeamAttendance };
+</file>
+
+<file path="controllers/user.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+// GET /users  - Admin HR directory of raw user accounts RBAC + session mgmt screens
+const listUsers = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['fullName', 'createdAt'], 'createdAt');
+  const { role, search } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(role ? { role } : {}),
+    ...(search
+      ? { OR: [{ fullName: { contains: search, mode: 'insensitive' } }, { email: { contains: search, mode: 'insensitive' } }] }
+      : {}),
+  };
+
+  const [total, users] = await Promise.all([
+    prisma.user.count({ where }),
+    prisma.user.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      select: { id: true, email: true, fullName: true, role: true, isActive: true, isVerified: true, lastLogin: true, createdAt: true },
+    }),
+  ]);
+
+  res.json({ success: true, data: users, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+// PATCH /users/:id/status  - Admin activate/deactivate override
+const setUserStatus = asyncHandler(async (req, res) => {
+  const { isActive } = req.body;
+  if (typeof isActive !== 'boolean') throw new ApiError(400, 'isActive must be true or false');
+
+  const user = await prisma.user.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!user) throw new ApiError(404, 'User not found');
+
+  const updated = await prisma.user.update({ where: { id: user.id }, data: { isActive } });
+
+  if (!isActive) {
+    // Deactivation also kills any live sessions immediately.
+    await prisma.session.deleteMany({ where: { userId: user.id } });
+  }
+
+  await writeAudit({
+    userId: req.user.id,
+    action: 'SET_USER_STATUS',
+    module: 'Users',
+    oldData: { isActive: user.isActive },
+    newData: { isActive },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+// PATCH /users/:id/role  - Admin RBAC role change
+const setUserRole = asyncHandler(async (req, res) => {
+  const { role } = req.body;
+  if (!['EMPLOYEE', 'MANAGER', 'HR', 'ADMIN'].includes(role)) throw new ApiError(400, 'Invalid role');
+
+  const user = await prisma.user.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!user) throw new ApiError(404, 'User not found');
+
+  const updated = await prisma.user.update({ where: { id: user.id }, data: { role } });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: 'SET_USER_ROLE',
+    module: 'Users',
+    oldData: { role: user.role },
+    newData: { role },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = { listUsers, setUserStatus, setUserRole };
+</file>
+
+<file path="middleware/audit.js">
+const prisma = require('../config/db');
+
+// Fire-and-forget audit log writer used by controllers after a mutating action.
+const writeAudit = async ({ userId, action, module, oldData, newData }) => {
+  try {
+    await prisma.auditLog.create({
+      data: { userId, action, module, oldData: oldData ?? undefined, newData: newData ?? undefined },
+    });
+  } catch (err) {
+    console.error('Failed to write audit log:', err.message);
+  }
+};
+
+module.exports = { writeAudit };
+</file>
+
+<file path="middleware/auth.js">
+const jwt = require("jsonwebtoken");
+const ApiError = require("../utils/ApiError");
+const prisma = require("../config/db");
+
+// Verifies the access token and attaches the Db user with employee profile to req.user
+const authenticate = async (req, res, next) => {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) throw new ApiError(401, "Access token missing");
+
+    const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      include: { employee: true },
+    });
+
+    if (!user || user.deletedAt) throw new ApiError(401, "User not found");
+    if (!user.isActive) throw new ApiError(403, "Account has been deactivated");
+
+    req.user = user;
+    next();
+  } catch (err) {
+    if (err instanceof ApiError) return next(err);
+    return next(new ApiError(401, "Invalid or expired access token"));
+  }
+};
+
+// Restricts a route to one or more roles e.g. authorize('HR', 'ADMIN')
+const authorize =
+  (...roles) =>
+  (req, res, next) => {
+    if (!req.user) return next(new ApiError(401, "Not authenticated"));
+
+    const role = (req.user.role || req.user.employee?.role || "").toUpperCase();
+
+    if (!role || !roles.includes(role)) {
+      return next(
+        new ApiError(403, "You do not have permission to perform this action"),
+      );
+    }
+    next();
+  };
+
+module.exports = { authenticate, authorize };
+</file>
+
+<file path="middleware/errorHandler.js">
+const ApiError = require('../utils/ApiError');
+
+// Centralized error handler - every controller throws/forwards errors here
+// instead of building its own response shape.
+const errorHandler = (err, req, res, next) => {
+  if (err instanceof ApiError) {
+    return res.status(err.statusCode).json({ success: false, message: err.message });
+  }
+
+  // Prisma known errors
+  if (err.code === 'P2002') {
+    return res.status(409).json({
+      success: false,
+      message: `A record with this ${err.meta?.target?.join(', ')} already exists`,
+    });
+  }
+  if (err.code === 'P2025') {
+    return res.status(404).json({ success: false, message: 'Record not found' });
+  }
+
+  console.error(err);
+  return res.status(500).json({ success: false, message: 'Internal server error' });
+};
+
+const notFound = (req, res) => {
+  res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found` });
+};
+
+module.exports = { errorHandler, notFound };
+</file>
+
+<file path="middleware/validate.js">
+const ApiError = require('../utils/ApiError');
+
+// Generic Zod validation middleware - fulfils the "strict schema validation on
+// every boundary endpoint" non-functional requirement without a framework.
+const validate = (schema) => (req, res, next) => {
+  const result = schema.safeParse(req.body);
+  if (!result.success) {
+    const message = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join(', ');
+    return next(new ApiError(400, message));
+  }
+  req.body = result.data;
+  next();
+};
+
+module.exports = validate;
+</file>
+
+<file path="routes/attendance.routes.js">
+const router = require('express').Router();
+const attendance = require('../controllers/attendance.controller');
+const { authenticate } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.post('/clock-in', attendance.clockIn);
+router.post('/clock-out', attendance.clockOut);
+router.post('/breaks/start', attendance.startBreak);
+router.post('/breaks/end', attendance.endBreak);
+router.get('/', attendance.listAttendance);
+
+module.exports = router;
+</file>
+
+<file path="routes/audit.routes.js">
+const router = require('express').Router();
+const audit = require('../controllers/audit.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.get('/', authenticate, authorize('HR', 'ADMIN'), audit.listAuditLogs);
+
+module.exports = router;
+</file>
+
+<file path="routes/auth.routes.js">
+const router = require('express').Router();
+const auth = require('../controllers/auth.controller');
+const { authenticate } = require('../middleware/auth');
+
+router.post('/login', auth.login);
+router.post('/activate', auth.activate);
+router.post('/refresh', auth.refresh);
+router.post('/logout', auth.logout);
+router.get('/me', authenticate, auth.me);
+router.get('/sessions', authenticate, auth.listMySessions);
+
+module.exports = router;
+</file>
+
+<file path="routes/department.routes.js">
+const router = require('express').Router();
+const departments = require('../controllers/department.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.get('/', departments.listDepartments);
+router.get('/:id', departments.getDepartment);
+router.post('/', authorize('HR', 'ADMIN'), departments.createDepartment);
+router.put('/:id', authorize('HR', 'ADMIN'), departments.updateDepartment);
+router.delete('/:id', authorize('HR', 'ADMIN'), departments.deleteDepartment);
+
+module.exports = router;
+</file>
+
+<file path="routes/employee.routes.js">
+const router = require("express").Router();
+const employees = require("../controllers/employee.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+console.log("EMPLOYEE ROUTER FILE LOADED");
+router.use(authenticate);
+
+router.post("/onboard", authorize("HR", "ADMIN"), employees.onboardEmployee);
+
+router.get("/", authorize("MANAGER", "HR", "ADMIN"), employees.listEmployees);
+router.get("/:id", employees.getEmployee);
+router.put("/:id", employees.updateEmployee);
+router.delete("/:id", authorize("HR", "ADMIN"), employees.softDeleteEmployee);
+router.post("/:id/documents", employees.addDocument);
+
+module.exports = router;
+</file>
+
+<file path="routes/goal.routes.js">
+const router = require('express').Router();
+const goals = require('../controllers/goal.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.post('/', authorize('MANAGER', 'HR', 'ADMIN'), goals.createGoal);
+router.get('/', goals.listGoals);
+router.get('/:id', goals.getGoal);
+router.patch('/:id/progress', goals.updateProgress);
+router.patch('/:id/validate', authorize('MANAGER', 'HR', 'ADMIN'), goals.validateGoal);
+
+module.exports = router;
+</file>
+
+<file path="routes/hrDashboard.routes.js">
+const router = require("express").Router();
+
+const { authenticate, authorize } = require("../middleware/auth");
+
+const { getHRDashboard } = require("../controllers/hrDashboard.controller");
+
+router.get("/", authenticate, authorize("HR", "ADMIN"), getHRDashboard);
+
+module.exports = router;
+</file>
+
+<file path="routes/index.js">
+const router = require("express").Router();
+
+router.use("/auth", require("./auth.routes"));
+router.use("/sessions", require("./session.routes"));
+router.use("/users", require("./user.routes"));
+router.use("/employees", require("./employee.routes"));
+router.use("/departments", require("./department.routes"));
+router.use("/teams", require("./team.routes"));
+router.use("/attendance", require("./attendance.routes"));
+// leave.routes.js registers /leave-types, /leave-balances, /leave-requests itself
+router.use("/", require("./leave.routes"));
+router.use("/goals", require("./goal.routes"));
+// review.routes.js registers /review-cycles, /review-templates, /reviews itself
+router.use("/", require("./review.routes"));
+router.use("/notifications", require("./notification.routes"));
+router.use("/audit-logs", require("./audit.routes"));
+router.use("/profile", require("./profile.routes"));
+router.use("/hr/dashboard", require("./hrDashboard.routes"));
+router.use("/rbac", require("./rbac.routes"));
+
+module.exports = router;
+</file>
+
+<file path="routes/leave.routes.js">
+const router = require('express').Router();
+const leave = require('../controllers/leave.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.get('/leave-types', leave.listLeaveTypes);
+router.post('/leave-types', authorize('HR', 'ADMIN'), leave.createLeaveType);
+router.get('/leave-balances', leave.getLeaveBalances);
+
+router.post('/leave-requests', leave.createLeaveRequest);
+router.get('/leave-requests', leave.listLeaveRequests);
+router.put('/leave-requests/:id/manager-review', authorize('MANAGER', 'HR', 'ADMIN'), leave.managerReview);
+router.put('/leave-requests/:id/hr-approve', authorize('HR', 'ADMIN'), leave.hrApprove);
+
+module.exports = router;
+</file>
+
+<file path="routes/notification.routes.js">
+const router = require("express").Router();
+const notifications = require("../controllers/notification.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+router.use(authenticate);
+
+router.get("/", notifications.listNotifications);
+router.patch("/:id/read", notifications.markRead);
+
+router.post(
+  "/broadcast",
+  authorize("HR", "ADMIN"),
+  notifications.broadcastNotification,
+);
+router.get(
+  "/broadcasts",
+  authorize("HR", "ADMIN"),
+  notifications.listBroadcasts,
+);
+
+module.exports = router;
+</file>
+
+<file path="routes/profile.routes.js">
+const express = require("express");
+
+const router = express.Router();
+
+const { getMyProfile } = require("../controllers/employee.controller");
+
+const { authenticate } = require("../middleware/auth");
+
+router.get("/me", authenticate, getMyProfile);
+
+module.exports = router;
+</file>
+
+<file path="routes/rbac.routes.js">
+const router = require("express").Router();
+const rbac = require("../controllers/rbac.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+router.use(authenticate);
+router.use(authorize("ADMIN"));
+
+router.get("/roles", rbac.listRoles);
+router.post("/roles", rbac.createRole);
+router.get("/roles/:id/permissions", rbac.getRolePermissions);
+router.put("/roles/:id/permissions", rbac.setRolePermissions);
+
+router.get("/permissions", rbac.listPermissions);
+router.post("/permissions", rbac.createPermission);
+
+module.exports = router;
+</file>
+
+<file path="routes/review.routes.js">
+const router = require("express").Router();
+const reviews = require("../controllers/review.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+router.use(authenticate);
+
+router.post(
+  "/review-cycles",
+  authorize("HR", "ADMIN"),
+  reviews.createReviewCycle,
+);
+router.get("/review-cycles", reviews.listReviewCycles);
+router.post(
+  "/review-templates",
+  authorize("HR", "ADMIN"),
+  reviews.createReviewTemplate,
+);
+router.post(
+  "/review-templates/:id/questions",
+  authorize("HR", "ADMIN"),
+  reviews.addTemplateQuestion,
+);
+
+router.post("/reviews", authorize("HR", "ADMIN"), reviews.createReview);
+router.get("/reviews", reviews.listReviews);
+router.post("/reviews/:id/answers", reviews.submitAnswers);
+router.get("/reviews/:id/score", reviews.getScore);
+router.patch(
+  "/reviews/:id/publish",
+  authorize("HR", "ADMIN"),
+  reviews.publishReview,
+);
+router.patch("/reviews/:id/acknowledge", reviews.acknowledgeReview);
+
+module.exports = router;
+</file>
+
+<file path="routes/session.routes.js">
+const router = require('express').Router();
+const auth = require('../controllers/auth.controller');
+const { authenticate } = require('../middleware/auth');
+
+router.delete('/:id', authenticate, auth.revokeSession);
+
+module.exports = router;
+</file>
+
+<file path="routes/team.routes.js">
+const router = require('express').Router();
+const teams = require('../controllers/team.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.get('/', teams.listTeams);
+router.get('/:id', teams.getTeam);
+router.get('/:id/attendance', authorize('MANAGER', 'HR', 'ADMIN'), teams.getTeamAttendance);
+router.post('/', authorize('HR', 'ADMIN'), teams.createTeam);
+router.put('/:id', authorize('HR', 'ADMIN'), teams.updateTeam);
+router.delete('/:id', authorize('HR', 'ADMIN'), teams.deleteTeam);
+
+module.exports = router;
+</file>
+
+<file path="routes/user.routes.js">
+const router = require('express').Router();
+const users = require('../controllers/user.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+router.get('/', authorize('HR', 'ADMIN'), users.listUsers);
+router.patch('/:id/status', authorize('ADMIN'), users.setUserStatus);
+router.patch('/:id/role', authorize('ADMIN'), users.setUserRole);
+
+module.exports = router;
+</file>
+
+<file path="utils/ApiError.js">
+class ApiError extends Error {
+  constructor(statusCode, message = 'Something went wrong') {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
+module.exports = ApiError;
+</file>
+
+<file path="utils/asyncHandler.js">
+// Wraps an async route handler so thrown errors go to Express's error middleware
+// instead of crashing the process or needing a try/catch in every controller.
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+module.exports = asyncHandler;
+</file>
+
+<file path="utils/mailer.js">
+const nodemailer = require('nodemailer');
+
+const hasSmtpConfig = () => !!(process.env.SMTP_HOST && process.env.SMTP_USER);
+
+const getTransport = () =>
+  nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT) || 587,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+
+const sendMail = async ({ to, subject, html }) => {
+  if (!hasSmtpConfig()) {
+    console.log(`[mailer] SMTP not configured - would send to ${to}: ${subject}\n${html}`);
+    return;
+  }
+  const transport = getTransport();
+  await transport.sendMail({ from: process.env.SMTP_FROM, to, subject, html });
+};
+
+module.exports = { sendMail };
+</file>
+
+<file path="utils/pagination.js">
+// Shared helper for the "every list endpoint must support pagination,
+// filtering, sorting, search" non-functional requirement.
+const getPagination = (query) => {
+  const page = Math.max(parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(query.limit, 10) || 20, 1), 100);
+  const skip = (page - 1) * limit;
+  return { page, limit, skip };
+};
+
+const getSort = (query, allowedFields = [], fallback = 'createdAt') => {
+  const field = allowedFields.includes(query.sortBy) ? query.sortBy : fallback;
+  const order = query.sortOrder === 'asc' ? 'asc' : 'desc';
+  return { [field]: order };
+};
+
+module.exports = { getPagination, getSort };
+</file>
+
+<file path="utils/tokens.js">
+const jwt = require('jsonwebtoken');
+
+const signAccessToken = (user) =>
+  jwt.sign(
+    { id: user.id, role: user.role, email: user.email },
+    process.env.ACCESS_TOKEN_SECRET,
+    { expiresIn: process.env.ACCESS_TOKEN_EXPIRY || '1d' }
+  );
+
+const signRefreshToken = (user) =>
+  jwt.sign({ id: user.id }, process.env.REFRESH_TOKEN_SECRET, {
+    expiresIn: process.env.REFRESH_TOKEN_EXPIRY || '10d',
+  });
+
+// Converts "10d" / "1d" / "15m" style strings into a millisecond offset for
+// storing Session.expiresAt.
+const expiryToDate = (expiryStr) => {
+  const match = /^(\d+)([smhd])$/.exec(expiryStr || '10d');
+  const [, amountStr, unit] = match || [null, '10', 'd'];
+  const amount = Number(amountStr);
+  const unitMs = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[unit];
+  return new Date(Date.now() + amount * unitMs);
+};
+
+module.exports = { signAccessToken, signRefreshToken, expiryToDate };
+</file>
+
+<file path="app.js">
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
+
+const routes = require('./routes');
+const { errorHandler, notFound } = require('./middleware/errorHandler');
+
+const app = express();
+
+// --- Security hardening (NFR: Helmet, CORS whitelist, rate limiting) -------
+app.use(helmet());
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN === '*' ? true : process.env.CORS_ORIGIN?.split(','),
+    credentials: true,
+  })
+);
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(morgan('dev'));
+
+app.get('/hrms', (req, res) => res.json({ success: true, message: 'HRMS API is running' }));
+
+app.use('/api/v1', routes);
+
+app.use(notFound);
+app.use(errorHandler);
+
+module.exports = app;
+</file>
+
+<file path="repomix.txt">
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure  
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+config/
+  db.js
+controllers/
+  attendance.controller.js
+  audit.controller.js
+  auth.controller.js
+  department.controller.js
+  employee.controller.js
+  goal.controller.js
+  hrDashboard.controller.js
+  leave.controller.js
+  notification.controller.js
+  rbac.controller.js
+  review.controller.js
+  team.controller.js
+  user.controller.js
+middleware/
+  audit.js
+  auth.js
+  errorHandler.js
+  validate.js
+routes/
+  attendance.routes.js
+  audit.routes.js
+  auth.routes.js
+  department.routes.js
+  employee.routes.js
+  goal.routes.js
+  hrDashboard.routes.js
+  index.js
+  leave.routes.js
+  notification.routes.js
+  profile.routes.js
+  rbac.routes.js
+  review.routes.js
+  session.routes.js
+  team.routes.js
+  user.routes.js
+utils/
+  ApiError.js
+  asyncHandler.js
+  mailer.js
+  pagination.js
+  tokens.js
+app.js
+server.js
+testMail.js
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="config/db.js">
+const { PrismaClient } = require('@prisma/client');
+
+// Single shared Prisma client instance for the whole app.
+const prisma = new PrismaClient();
+
+module.exports = prisma;
+</file>
+
+<file path="controllers/attendance.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+
+const LATE_CUTOFF_HOUR = 9; // after 9:00 the clock-in is marked 'Late'
+
+const todayDateOnly = () => {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+
+const getEmployeeIdForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, 'This user has no employee profile');
+  return employee.id;
+};
+
+
+// POST /attendance/clock-in
+
+const clockIn = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+  const now = new Date();
+
+  const existing = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+  });
+  if (existing) throw new ApiError(409, 'Already clocked in for today');
+
+  const status = now.getUTCHours() >= LATE_CUTOFF_HOUR ? 'LATE' : 'PRESENT';
+
+  const attendance = await prisma.attendance.create({
+    data: { employeeId, attendanceDate, clockIn: now, status },
+  });
+
+  res.status(201).json({ success: true, data: attendance });
+});
+
+
+// POST /attendance/clock-out
+
+const clockOut = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+
+  const attendance = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+    include: { breaks: true },
+  });
+  if (!attendance) throw new ApiError(400, 'You have not clocked in today');
+  if (attendance.clockOut) throw new ApiError(409, 'Already clocked out for today');
+
+  const openBreak = attendance.breaks.find((b) => !b.endTime);
+  if (openBreak) throw new ApiError(400, 'End your active break before clocking out');
+
+  const now = new Date();
+  const grossMinutes = (now - attendance.clockIn) / 60000;
+  const breakMinutes = attendance.breaks.reduce((sum, b) => sum + (b.durationMinutes || 0), 0);
+  const totalHours = Math.max(0, (grossMinutes - breakMinutes) / 60);
+
+  const updated = await prisma.attendance.update({
+    where: { id: attendance.id },
+    data: { clockOut: now, totalHours: totalHours.toFixed(2) },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+
+// POST /attendance/breaks/start
+
+const startBreak = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+
+  const attendance = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+    include: { breaks: true },
+  });
+  if (!attendance) throw new ApiError(400, 'Clock in before starting a break');
+  if (attendance.clockOut) throw new ApiError(400, 'You have already clocked out today');
+  if (attendance.breaks.some((b) => !b.endTime)) throw new ApiError(409, 'A break is already in progress');
+
+  const brk = await prisma.attendanceBreak.create({
+    data: { attendanceId: attendance.id, startTime: new Date() },
+  });
+
+  res.status(201).json({ success: true, data: brk });
+});
+
+
+// POST /attendance/breaks/end
+
+const endBreak = asyncHandler(async (req, res) => {
+  const employeeId = await getEmployeeIdForUser(req.user.id);
+  const attendanceDate = todayDateOnly();
+
+  const attendance = await prisma.attendance.findUnique({
+    where: { employeeId_attendanceDate: { employeeId, attendanceDate } },
+    include: { breaks: true },
+  });
+  if (!attendance) throw new ApiError(400, 'No attendance record for today');
+
+  const openBreak = attendance.breaks.find((b) => !b.endTime);
+  if (!openBreak) throw new ApiError(400, 'No break in progress');
+
+  const now = new Date();
+  const durationMinutes = Math.round((now - openBreak.startTime) / 60000);
+
+  const updated = await prisma.attendanceBreak.update({
+    where: { id: openBreak.id },
+    data: { endTime: now, durationMinutes },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+
+// GET /attendance  - history, paginated/filterable/sortable.
+// Employees see only their own; managers/HR/admin can pass employeeId.
+
+const listAttendance = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['attendanceDate', 'createdAt'], 'attendanceDate');
+  const { from, to, status, employeeId } = req.query;
+
+  let targetEmployeeId = employeeId;
+  if (req.user.role === 'EMPLOYEE') {
+    targetEmployeeId = await getEmployeeIdForUser(req.user.id);
+  } else if (!targetEmployeeId) {
+    targetEmployeeId = req.user.employee ? req.user.employee.id : undefined;
+  }
+
+  const where = {
+    ...(targetEmployeeId ? { employeeId: targetEmployeeId } : {}),
+    ...(status ? { status } : {}),
+    ...(from || to
+      ? {
+          attendanceDate: {
+            ...(from ? { gte: new Date(from) } : {}),
+            ...(to ? { lte: new Date(to) } : {}),
+          },
+        }
+      : {}),
+  };
+
+  const [total, records] = await Promise.all([
+    prisma.attendance.count({ where }),
+    prisma.attendance.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: { breaks: true },
+    }),
+  ]);
+
+  res.json({ success: true, data: records, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+module.exports = { clockIn, clockOut, startBreak, endBreak, listAttendance };
+</file>
+
+<file path="controllers/audit.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const { getPagination, getSort } = require("../utils/pagination");
+
+// GET /audit-logs  - HR/Admin only, filterable
+const listAuditLogs = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ["createdAt"], "createdAt");
+  const { module, userId, action } = req.query;
+
+  const where = {
+    ...(module ? { module } : {}),
+    ...(userId ? { userId } : {}),
+    ...(action ? { action: { contains: action, mode: "insensitive" } } : {}),
+  };
+
+  const [total, logs] = await Promise.all([
+    prisma.auditLog.count({ where }),
+    prisma.auditLog.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: { user: { select: { fullName: true, email: true } } },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: logs,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+module.exports = { listAuditLogs };
+</file>
+
+<file path="controllers/auth.controller.js">
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const {
+  signAccessToken,
+  signRefreshToken,
+  expiryToDate,
+} = require("../utils/tokens");
+const { sendMail } = require("../utils/mailer");
+const { writeAudit } = require("../middleware/audit");
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax",
+};
+
+// POST /auth/login
+const login = asyncHandler(async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password)
+    throw new ApiError(400, "Email and password are required");
+
+  const user = await prisma.user.findUnique({
+    where: { email: email.toLowerCase() },
+  });
+  if (!user || user.deletedAt) throw new ApiError(401, "Invalid credentials");
+  if (!user.isActive) throw new ApiError(403, "Account has been deactivated");
+  if (!user.isVerified || !user.passwordHash) {
+    throw new ApiError(
+      403,
+      "Account not activated yet - please check your onboarding email",
+    );
+  }
+
+  const valid = await bcrypt.compare(password, user.passwordHash);
+  if (!valid) throw new ApiError(401, "Invalid credentials");
+
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
+
+  await prisma.session.create({
+    data: {
+      userId: user.id,
+      refreshToken,
+      ipAddress: req.ip,
+      deviceInfo: req.headers["user-agent"] || null,
+      expiresAt: expiryToDate(process.env.REFRESH_TOKEN_EXPIRY),
+    },
+  });
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { lastLogin: new Date() },
+  });
+
+  res.cookie("refreshToken", refreshToken, cookieOptions);
+  res.json({
+    success: true,
+    data: {
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.fullName,
+        role: user.role,
+      },
+    },
+  });
+});
+// POST /auth/activate
+// Activate account + save document URLs
+
+const activate = asyncHandler(async (req, res) => {
+  const { token, password, documents = [] } = req.body;
+
+  if (!token || !password) {
+    throw new ApiError(400, "Token and password are required");
+  }
+
+  if (password.length < 8) {
+    throw new ApiError(400, "Password must be at least 8 characters");
+  }
+
+  const user = await prisma.user.findUnique({
+    where: {
+      activationToken: token,
+    },
+  });
+
+  if (!user) {
+    throw new ApiError(400, "Invalid activation token");
+  }
+
+  if (user.activationTokenExpiry && user.activationTokenExpiry < new Date()) {
+    throw new ApiError(400, "Activation token expired");
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  const result = await prisma.$transaction(async (tx) => {
+    const updatedUser = await prisma.user.update({
+      where: {
+        id: user.id,
+      },
+      data: {
+        passwordHash: passwordHash,
+
+        isActive: true,
+
+        isVerified: true,
+
+        activationToken: null,
+
+        activationTokenExpiry: null,
+      },
+    });
+
+    const employee = await tx.employee.findUnique({
+      where: {
+        userId: user.id,
+      },
+    });
+
+    if (!employee) {
+      throw new ApiError(404, "Employee profile not found");
+    }
+
+    await tx.employee.update({
+      where: {
+        id: employee.id,
+      },
+
+      data: {
+        status: "ACTIVE",
+      },
+    });
+
+    if (documents.length > 0) {
+      await tx.employeeDocument.createMany({
+        data: documents.map((doc) => ({
+          employeeId: employee.id,
+
+          docType: doc.docType,
+
+          fileUrl: doc.fileUrl,
+        })),
+      });
+    }
+
+    return {
+      employeeId: employee.id,
+      userId: updatedUser.id,
+    };
+  });
+
+  await writeAudit({
+    userId: user.id,
+
+    action: "ACCOUNT_ACTIVATED",
+
+    module: "Employees",
+
+    newData: result,
+  });
+
+  res.json({
+    success: true,
+
+    message: "Account activated successfully",
+  });
+});
+
+// POST /auth/refresh
+const refresh = asyncHandler(async (req, res) => {
+  const token = req.body.refreshToken || req.cookies?.refreshToken;
+  if (!token) throw new ApiError(401, "Refresh token missing");
+
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET);
+  } catch {
+    throw new ApiError(401, "Invalid or expired refresh token");
+  }
+
+  const session = await prisma.session.findFirst({
+    where: { userId: decoded.id, refreshToken: token },
+  });
+  if (!session || session.expiresAt < new Date())
+    throw new ApiError(401, "Session expired, please log in again");
+
+  const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+  if (!user || !user.isActive || user.deletedAt)
+    throw new ApiError(401, "User not found or inactive");
+
+  const accessToken = signAccessToken(user);
+  res.json({ success: true, data: { accessToken } });
+});
+
+// POST /auth/logout
+const logout = asyncHandler(async (req, res) => {
+  const token = req.body.refreshToken || req.cookies?.refreshToken;
+  if (token)
+    await prisma.session.deleteMany({ where: { refreshToken: token } });
+  res.clearCookie("refreshToken", cookieOptions);
+  res.json({ success: true, message: "Logged out" });
+});
+
+// GET /auth/me
+const me = asyncHandler(async (req, res) => {
+  const { passwordHash, activationToken, ...safeUser } = req.user;
+  res.json({ success: true, data: safeUser });
+});
+
+// DELETE /sessions/:id
+const revokeSession = asyncHandler(async (req, res) => {
+  const session = await prisma.session.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!session) throw new ApiError(404, "Session not found");
+  if (session.userId !== req.user.id && req.user.role !== "ADMIN") {
+    throw new ApiError(403, "Not allowed to revoke this session");
+  }
+  await prisma.session.delete({ where: { id: session.id } });
+  res.json({ success: true, message: "Session revoked" });
+});
+// Show my sessions
+const listMySessions = asyncHandler(async (req, res) => {
+  const sessions = await prisma.session.findMany({
+    where: { userId: req.user.id },
+    select: {
+      id: true,
+      ipAddress: true,
+      deviceInfo: true,
+      expiresAt: true,
+      createdAt: true,
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  res.json({ success: true, data: sessions });
+});
+
+module.exports = {
+  login,
+  activate,
+  refresh,
+  logout,
+  me,
+  revokeSession,
+  listMySessions,
+  _internal: { sendMail, crypto },
+};
+</file>
+
+<file path="controllers/department.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+const createDepartment = asyncHandler(async (req, res) => {
+  const { name, managerId } = req.body;
+  if (!name) throw new ApiError(400, 'name is required');
+
+  const department = await prisma.department.create({ data: { name, managerId: managerId || null } });
+  await writeAudit({ userId: req.user.id, action: 'CREATE_DEPARTMENT', module: 'Departments', newData: department });
+  res.status(201).json({ success: true, data: department });
+});
+
+const listDepartments = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['name', 'createdAt'], 'name');
+  const { search } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}),
+  };
+
+  const [total, departments] = await Promise.all([
+    prisma.department.count({ where }),
+    prisma.department.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        manager: { select: { id: true, fullName: true, email: true } },
+        _count: { select: { employees: true, teams: true } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: departments, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+const getDepartment = asyncHandler(async (req, res) => {
+  const department = await prisma.department.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    include: { manager: { select: { id: true, fullName: true } }, teams: true },
+  });
+  if (!department) throw new ApiError(404, 'Department not found');
+  res.json({ success: true, data: department });
+});
+
+const updateDepartment = asyncHandler(async (req, res) => {
+  const { name, managerId } = req.body;
+  const department = await prisma.department.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!department) throw new ApiError(404, 'Department not found');
+
+  const updated = await prisma.department.update({
+    where: { id: department.id },
+    data: { ...(name && { name }), ...(managerId !== undefined && { managerId }) },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: 'UPDATE_DEPARTMENT',
+    module: 'Departments',
+    oldData: department,
+    newData: updated,
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+const deleteDepartment = asyncHandler(async (req, res) => {
+  const department = await prisma.department.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!department) throw new ApiError(404, 'Department not found');
+
+  await prisma.department.update({ where: { id: department.id }, data: { deletedAt: new Date() } });
+  await writeAudit({ userId: req.user.id, action: 'DELETE_DEPARTMENT', module: 'Departments', oldData: department });
+
+  res.json({ success: true, message: 'Department removed' });
+});
+
+module.exports = { createDepartment, listDepartments, getDepartment, updateDepartment, deleteDepartment };
+</file>
+
+<file path="controllers/employee.controller.js">
+const crypto = require("crypto");
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const { getPagination, getSort } = require("../utils/pagination");
+const { writeAudit } = require("../middleware/audit");
+const { sendMail } = require("../utils/mailer");
+const getMyProfile = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: {
+      userId: req.user.id,
+      deletedAt: null,
+    },
+
+    include: {
+      user: {
+        select: {
+          id: true,
+          fullName: true,
+          email: true,
+          role: true,
+        },
+      },
+
+      department: true,
+
+      team: true,
+
+      manager: {
+        include: {
+          user: {
+            select: {
+              fullName: true,
+            },
+          },
+        },
+      },
+
+      documents: true,
+    },
+  });
+
+  if (!employee) {
+    throw new ApiError(404, "Employee profile not found");
+  }
+
+  res.json({
+    success: true,
+    data: employee,
+  });
+});
+
+// POST /employees/onboard  - HR creates the USERS + EMPLOYEES instance,
+// generates the activation token and emails the invite link.
+
+const onboardEmployee = asyncHandler(async (req, res) => {
+  const {
+    email,
+    fullName,
+    role = "EMPLOYEE",
+    employeeCode,
+    designation,
+    departmentId,
+    teamId,
+    managerId,
+    employmentType = "FULL_TIME",
+    salary,
+    joiningDate,
+  } = req.body;
+
+  if (!email || !fullName || !employeeCode || !designation || !joiningDate) {
+    throw new ApiError(
+      400,
+      "email, fullName, employeeCode, designation and joiningDate are required",
+    );
+  }
+
+  const existing = await prisma.user.findUnique({
+    where: {
+      email: email.toLowerCase(),
+    },
+  });
+
+  if (existing) {
+    throw new ApiError(409, "A user with this email already exists");
+  }
+
+  const activationToken = crypto.randomBytes(32).toString("hex");
+
+  const activationTokenExpiry = new Date(
+    Date.now() +
+      (Number(process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES) || 60) * 60 * 1000,
+  );
+
+  const result = await prisma.$transaction(async (tx) => {
+    const user = await tx.user.create({
+      data: {
+        email: email.toLowerCase(),
+        fullName,
+        role,
+
+        isActive: false,
+        isVerified: false,
+
+        activationToken,
+        activationTokenExpiry,
+      },
+    });
+
+    const employee = await tx.employee.create({
+      data: {
+        userId: user.id,
+
+        employeeCode,
+
+        designation,
+
+        employmentType,
+
+        salary: salary ?? null,
+
+        joiningDate: new Date(joiningDate),
+
+        status: "PENDING",
+
+        departmentId: departmentId || null,
+
+        teamId: teamId || null,
+
+        managerId: managerId || null,
+      },
+    });
+
+    return {
+      user,
+      employee,
+    };
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+
+    action: "ONBOARD_EMPLOYEE",
+
+    module: "Employees",
+
+    newData: {
+      userId: result.user.id,
+      employeeId: result.employee.id,
+    },
+  });
+  const activationLink = `${process.env.CLIENT_URL}/setup?token=${activationToken}`;
+
+  try {
+    await sendMail({
+      to: email,
+
+      subject: "Activate your HRMS Account",
+
+      html: `
+  
+      <div style="font-family:Arial">
+  
+      <h2>Welcome ${fullName}</h2>
+  
+  
+      <p>
+      Your HRMS account has been created.
+      </p>
+  
+  
+      <p>
+      Click below to activate your account:
+      </p>
+  
+  
+      <a href="${activationLink}"
+      style="
+      background:#2563eb;
+      color:white;
+      padding:12px 20px;
+      text-decoration:none;
+      border-radius:5px;
+      ">
+  
+      Activate Account
+  
+      </a>
+  
+  
+      <p>
+      This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES} minutes.
+      </p>
+  
+  
+      </div>
+  
+      `,
+    });
+  } catch (error) {
+    console.error("Onboarding email failed to send:", error.message);
+  }
+
+  res.status(201).json({
+    success: true,
+    message: "Employee onboarded successfully - activation email sent",
+    data: {
+      userId: result.user.id,
+      employeeId: result.employee.id,
+    },
+  });
+});
+// GET /employees  - directory list with pagination/filter/search/sort
+const listEmployees = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(
+    req.query,
+    ["joiningDate", "createdAt", "designation"],
+    "createdAt",
+  );
+  const { search, departmentId, teamId, status } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(departmentId ? { departmentId } : {}),
+    ...(teamId ? { teamId } : {}),
+    ...(status ? { status } : {}),
+    ...(search
+      ? {
+          OR: [
+            { designation: { contains: search, mode: "insensitive" } },
+            { employeeCode: { contains: search, mode: "insensitive" } },
+            { user: { fullName: { contains: search, mode: "insensitive" } } },
+            { user: { email: { contains: search, mode: "insensitive" } } },
+          ],
+        }
+      : {}),
+  };
+
+  const [total, employees] = await Promise.all([
+    prisma.employee.count({ where }),
+    prisma.employee.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            role: true,
+            isActive: true,
+          },
+        },
+        department: { select: { id: true, name: true } },
+        team: { select: { id: true, name: true } },
+      },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: employees,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+// GET /employees/:id
+
+const getEmployee = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    include: {
+      user: {
+        select: {
+          id: true,
+          fullName: true,
+          email: true,
+          role: true,
+          isActive: true,
+          isVerified: true,
+        },
+      },
+      department: true,
+      team: true,
+      manager: { include: { user: { select: { fullName: true } } } },
+      documents: true,
+    },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+  res.json({ success: true, data: employee });
+});
+
+// PUT /employees/:id  - update profile fields (self or HR/Admin)
+const updateEmployee = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+
+  const isSelf = employee.userId === req.user.id;
+  const isPrivileged = ["HR", "ADMIN"].includes(req.user.role);
+  if (!isSelf && !isPrivileged)
+    throw new ApiError(403, "Not allowed to update this employee");
+
+  // Self-service employees may only touch their own contact-ish fields;
+  // org placement / pay / status stays HR & Admin only.
+  const selfAllowed = ["designation"];
+  const privilegedOnly = [
+    "departmentId",
+    "teamId",
+    "managerId",
+    "employmentType",
+    "salary",
+    "status",
+  ];
+
+  const data = {};
+  for (const key of Object.keys(req.body)) {
+    if (
+      isPrivileged &&
+      (selfAllowed.includes(key) || privilegedOnly.includes(key))
+    )
+      data[key] = req.body[key];
+    else if (isSelf && selfAllowed.includes(key)) data[key] = req.body[key];
+  }
+
+  const updated = await prisma.employee.update({
+    where: { id: employee.id },
+    data,
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "UPDATE_EMPLOYEE",
+    module: "Employees",
+    oldData: employee,
+    newData: updated,
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+// DELETE /employees/:id  - soft delete (HR/Admin only)
+
+const softDeleteEmployee = asyncHandler(async (req, res) => {
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+
+  await prisma.employee.update({
+    where: { id: employee.id },
+    data: { deletedAt: new Date(), status: "TERMINATED" },
+  });
+  await prisma.user.update({
+    where: { id: employee.userId },
+    data: { deletedAt: new Date(), isActive: false },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "DELETE_EMPLOYEE",
+    module: "Employees",
+    oldData: employee,
+  });
+
+  res.json({ success: true, message: "Employee removed" });
+});
+
+// POST /employees/:id/documents  - record an uploaded personal/tax document
+// (expects the file to already be uploaded to storage; this just stores the URL)
+
+const addDocument = asyncHandler(async (req, res) => {
+  const { docType, fileUrl } = req.body;
+  if (!docType || !fileUrl)
+    throw new ApiError(400, "docType and fileUrl are required");
+
+  const employee = await prisma.employee.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+  });
+  if (!employee) throw new ApiError(404, "Employee not found");
+  if (
+    employee.userId !== req.user.id &&
+    !["HR", "ADMIN"].includes(req.user.role)
+  ) {
+    throw new ApiError(
+      403,
+      "Not allowed to upload documents for this employee",
+    );
+  }
+
+  const doc = await prisma.employeeDocument.create({
+    data: { employeeId: employee.id, docType, fileUrl },
+  });
+
+  res.status(201).json({ success: true, data: doc });
+});
+
+module.exports = {
+  onboardEmployee,
+  listEmployees,
+  getEmployee,
+  updateEmployee,
+  softDeleteEmployee,
+  getMyProfile,
+  addDocument,
+};
+</file>
+
+<file path="controllers/goal.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+
+const getEmployeeForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, 'This user has no employee profile');
+  return employee;
+};
+
+const notify = (userId, type, title, message) =>
+  prisma.notification.create({ data: { userId, type, title, message } });
+
+ 
+// POST /goals  - manager assigns a goal to a direct report 
+const createGoal = asyncHandler(async (req, res) => {
+  const { employeeId, title, description, targetDate, priority = 'MEDIUM' } = req.body;
+  if (!employeeId || !title || !targetDate) throw new ApiError(400, 'employeeId, title and targetDate are required');
+
+  const creator = await getEmployeeForUser(req.user.id);
+
+  if (req.user.role === 'MANAGER') {
+    const target = await prisma.employee.findUnique({ where: { id: employeeId } });
+    if (!target || target.managerId !== creator.id) {
+      throw new ApiError(403, 'You can only assign goals to your direct reports');
+    }
+  }
+
+  const goal = await prisma.goal.create({
+    data: {
+      employeeId,
+      createdById: creator.id,
+      title,
+      description,
+      targetDate: new Date(targetDate),
+      priority,
+      status: 'NOT_STARTED',
+      progress: 0,
+    },
+  });
+
+  const target = await prisma.employee.findUnique({ where: { id: employeeId } });
+  await notify(target.userId, 'GOAL_ASSIGNED', 'New goal assigned', `A new goal "${title}" has been assigned to you.`);
+
+  res.status(201).json({ success: true, data: goal });
+});
+
+ 
+// GET /goals  - employee sees own; manager sees direct reports' 
+const listGoals = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['targetDate', 'createdAt', 'progress'], 'createdAt');
+  const { status, employeeId } = req.query;
+
+  let where = { ...(status ? { status } : {}) };
+
+  if (req.user.role === 'EMPLOYEE') {
+    const employee = await getEmployeeForUser(req.user.id);
+    where.employeeId = employee.id;
+  } else if (req.user.role === 'MANAGER' && !employeeId) {
+    const manager = await getEmployeeForUser(req.user.id);
+    where.employee = { managerId: manager.id };
+  } else if (employeeId) {
+    where.employeeId = employeeId;
+  }
+
+  const [total, goals] = await Promise.all([
+    prisma.goal.count({ where }),
+    prisma.goal.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        employee: { include: { user: { select: { fullName: true } } } },
+        updates: { orderBy: { createdAt: 'desc' } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: goals, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+const getGoal = asyncHandler(async (req, res) => {
+  const goal = await prisma.goal.findUnique({
+    where: { id: req.params.id },
+    include: { updates: { orderBy: { createdAt: 'desc' } }, employee: { include: { user: true } } },
+  });
+  if (!goal) throw new ApiError(404, 'Goal not found');
+  res.json({ success: true, data: goal });
+});
+
+ 
+// PATCH /goals/:id/progress  - employee edits percent-complete with a comment 
+const updateProgress = asyncHandler(async (req, res) => {
+  const { progress, comment } = req.body;
+  if (progress === undefined || progress < 0 || progress > 100) throw new ApiError(400, 'progress must be 0-100');
+  if (!comment) throw new ApiError(400, 'A comment is required for every progress update');
+
+  const goal = await prisma.goal.findUnique({ where: { id: req.params.id }, include: { employee: true } });
+  if (!goal) throw new ApiError(404, 'Goal not found');
+  if (goal.employee.userId !== req.user.id) throw new ApiError(403, 'You can only update your own goal progress');
+
+  const status = progress === 100 ? 'ACHIEVED' : progress > 0 ? 'IN_PROGRESS' : 'NOT_STARTED';
+
+  const [updated] = await prisma.$transaction([
+    prisma.goal.update({ where: { id: goal.id }, data: { progress, status } }),
+    prisma.goalUpdate.create({ data: { goalId: goal.id, progress, comment } }),
+  ]);
+
+  if (progress === 100) {
+    const creator = await prisma.employee.findUnique({ where: { id: goal.createdById } });
+    if (creator) {
+      await notify(
+        creator.userId,
+        'GOAL_VALIDATION',
+        'Goal ready for validation',
+        `"${goal.title}" reached 100% and needs your validation.`
+      );
+    }
+  }
+
+  res.json({ success: true, data: updated });
+});
+
+ 
+// PATCH /goals/:id/validate  - manager validates a goal at 100% progress 
+const validateGoal = asyncHandler(async (req, res) => {
+  const goal = await prisma.goal.findUnique({ where: { id: req.params.id } });
+  if (!goal) throw new ApiError(404, 'Goal not found');
+  if (goal.progress !== 100) throw new ApiError(400, 'Goal must be at 100% progress before it can be validated');
+
+  const manager = await getEmployeeForUser(req.user.id);
+  if (req.user.role === 'MANAGER' && goal.createdById !== manager.id) {
+    throw new ApiError(403, 'Only the goal creator (manager) can validate it');
+  }
+
+  const updated = await prisma.goal.update({
+    where: { id: goal.id },
+    data: { validatedAt: new Date(), status: 'ACHIEVED' },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = { createGoal, listGoals, getGoal, updateProgress, validateGoal };
+</file>
+
+<file path="controllers/hrDashboard.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+
+// GET /hr/dashboard
+
+const getHRDashboard = asyncHandler(async (req, res) => {
+  const [
+    employees,
+    pendingLeaves,
+    onboarding,
+    totalReviews,
+    completedReviews,
+    alerts,
+  ] = await Promise.all([
+    // Total active employees
+    prisma.employee.count({
+      where: {
+        deletedAt: null,
+        status: "ACTIVE",
+      },
+    }),
+
+    // Pending leave requests
+    prisma.leaveRequest.count({
+      where: {
+        status: "PENDING",
+      },
+    }),
+
+    // Pending onboarding
+    prisma.employee.count({
+      where: {
+        status: "PENDING",
+      },
+    }),
+
+    // All reviews
+    prisma.review.count(),
+
+    // Completed reviews
+    prisma.review.count({
+      where: {
+        status: {
+          in: ["SUBMITTED", "PUBLISHED", "ACKNOWLEDGED"],
+        },
+      },
+    }),
+
+    // Latest audit logs
+    prisma.auditLog.findMany({
+      take: 5,
+
+      orderBy: {
+        createdAt: "desc",
+      },
+
+      include: {
+        user: {
+          select: {
+            fullName: true,
+            email: true,
+          },
+        },
+      },
+    }),
+  ]);
+
+  const reviewProgress =
+    totalReviews > 0 ? Math.round((completedReviews / totalReviews) * 100) : 0;
+  res.json({
+    success: true,
+
+    data: {
+      totalEmployees: employees,
+
+      pendingLeaves,
+
+      onboardingEmployees: onboarding,
+
+      reviewProgress,
+
+      attendanceAlerts: 0,
+
+      latestAudit: alerts,
+    },
+  });
+});
+
+module.exports = {
+  getHRDashboard,
+};
+</file>
+
+<file path="controllers/leave.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+const getEmployeeIdForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, 'This user has no employee profile');
+  return employee;
+};
+
+const daysBetweenInclusive = (start, end) => Math.floor((end - start) / 86400000) + 1;
+
+const notify = (userId, type, title, message) =>
+  prisma.notification.create({ data: { userId, type, title, message } });
+
+ 
+// GET /leave-types 
+const listLeaveTypes = asyncHandler(async (req, res) => {
+  const leaveTypes = await prisma.leaveType.findMany({ orderBy: { name: 'asc' } });
+  res.json({ success: true, data: leaveTypes });
+});
+
+const createLeaveType = asyncHandler(async (req, res) => {
+  const { name, defaultAllocation = 0 } = req.body;
+  if (!name) throw new ApiError(400, 'name is required');
+  const leaveType = await prisma.leaveType.create({ data: { name, defaultAllocation } });
+  res.status(201).json({ success: true, data: leaveType });
+});
+
+ 
+// GET /leave-balances  - current employee's balances, or ?employeeId= for HR
+ 
+const getLeaveBalances = asyncHandler(async (req, res) => {
+  let employeeId = req.query.employeeId;
+  if (req.user.role === 'EMPLOYEE' || !employeeId) {
+    const employee = await getEmployeeIdForUser(req.user.id);
+    employeeId = employee.id;
+  }
+
+  const balances = await prisma.leaveBalance.findMany({
+    where: { employeeId },
+    include: { leaveType: true },
+  });
+
+  res.json({ success: true, data: balances });
+});
+
+ 
+// POST /leave-requests  - employee submits, validated against balance quota
+const createLeaveRequest = asyncHandler(async (req, res) => {
+  const { leaveTypeId, startDate, endDate, reason } = req.body;
+  if (!leaveTypeId || !startDate || !endDate || !reason) {
+    throw new ApiError(400, 'leaveTypeId, startDate, endDate and reason are required');
+  }
+
+  const employee = await getEmployeeIdForUser(req.user.id);
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (end < start) throw new ApiError(400, 'endDate cannot be before startDate');
+  const days = daysBetweenInclusive(start, end);
+
+  const balance = await prisma.leaveBalance.findUnique({
+    where: { employeeId_leaveTypeId: { employeeId: employee.id, leaveTypeId } },
+  });
+  if (!balance || balance.remainingDays < days) {
+    throw new ApiError(400, 'Insufficient leave balance for this request');
+  }
+
+  const leaveRequest = await prisma.leaveRequest.create({
+    data: { employeeId: employee.id, leaveTypeId, startDate: start, endDate: end, days, reason },
+  });
+
+  if (employee.managerId) {
+    const manager = await prisma.employee.findUnique({ where: { id: employee.managerId } });
+    if (manager) {
+      await notify(
+        manager.userId,
+        'LEAVE_REQUEST',
+        'New leave request',
+        `A leave request for ${days} day(s) is waiting for your review.`
+      );
+    }
+  }
+
+  res.status(201).json({ success: true, data: leaveRequest });
+});
+
+ 
+// GET /leave-requests  - employee sees own; manager sees direct reports'
+// pending-manager-review; HR sees all pending-HR / all, filterable
+ 
+const listLeaveRequests = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['requestedAt', 'startDate'], 'requestedAt');
+  const { status, employeeId } = req.query;
+
+  let where = { ...(status ? { status } : {}) };
+
+  if (req.user.role === 'EMPLOYEE') {
+    const employee = await getEmployeeIdForUser(req.user.id);
+    where.employeeId = employee.id;
+  } else if (req.user.role === 'MANAGER') {
+    const manager = await getEmployeeIdForUser(req.user.id);
+    where.employee = { managerId: manager.id };
+    if (!status) where.status = 'PENDING';
+  } else if (employeeId) {
+    where.employeeId = employeeId;
+  }
+
+  const [total, requests] = await Promise.all([
+    prisma.leaveRequest.count({ where }),
+    prisma.leaveRequest.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        leaveType: true,
+        employee: { include: { user: { select: { fullName: true, email: true } } } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: requests, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+ 
+// PUT /leave-requests/:id/manager-review  - first-gate approval
+ 
+const managerReview = asyncHandler(async (req, res) => {
+  const { decision, comment } = req.body; // decision: 'APPROVE' | 'REJECT'
+  if (!['APPROVE', 'REJECT'].includes(decision)) throw new ApiError(400, "decision must be 'APPROVE' or 'REJECT'");
+
+  const leaveRequest = await prisma.leaveRequest.findUnique({
+    where: { id: req.params.id },
+    include: { employee: true },
+  });
+  if (!leaveRequest) throw new ApiError(404, 'Leave request not found');
+  if (leaveRequest.status !== 'PENDING') throw new ApiError(400, 'This request has already moved past manager review');
+
+  const manager = await getEmployeeIdForUser(req.user.id);
+  if (req.user.role === 'MANAGER' && leaveRequest.employee.managerId !== manager.id) {
+    throw new ApiError(403, 'You can only review requests from your direct reports');
+  }
+
+  const status = decision === 'APPROVE' ? 'APPROVED_MANAGER' : 'REJECTED';
+
+  const updated = await prisma.leaveRequest.update({
+    where: { id: leaveRequest.id },
+    data: { status, managerComment: comment || null, decidedAt: decision === 'REJECT' ? new Date() : null },
+  });
+
+  await notify(
+    leaveRequest.employee.userId,
+    status === 'REJECTED' ? 'LEAVE_REJECTED' : 'LEAVE_REQUEST',
+    status === 'REJECTED' ? 'Leave request rejected' : 'Leave request approved by manager',
+    status === 'REJECTED'
+      ? `Your manager rejected your leave request. Reason: ${comment || 'No reason given'}`
+      : 'Your manager approved your leave request. It now moves to HR for final approval.'
+  );
+
+  await writeAudit({
+    userId: req.user.id,
+    action: `LEAVE_MANAGER_${decision}`,
+    module: 'Leave',
+    oldData: leaveRequest,
+    newData: updated,
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+ 
+// PUT /leave-requests/:id/hr-approve  - second-gate, atomic balance deduction
+ 
+const hrApprove = asyncHandler(async (req, res) => {
+  const { decision, comment } = req.body; // decision: 'APPROVE' | 'REJECT'
+  if (!['APPROVE', 'REJECT'].includes(decision)) throw new ApiError(400, "decision must be 'APPROVE' or 'REJECT'");
+
+  const leaveRequest = await prisma.leaveRequest.findUnique({
+    where: { id: req.params.id },
+    include: { employee: true },
+  });
+  if (!leaveRequest) throw new ApiError(404, 'Leave request not found');
+  if (leaveRequest.status !== 'APPROVED_MANAGER') {
+    throw new ApiError(400, 'This request is not awaiting HR approval');
+  }
+
+  const status = decision === 'APPROVE' ? 'APPROVED_HR' : 'REJECTED';
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const req_ = await tx.leaveRequest.update({
+      where: { id: leaveRequest.id },
+      data: { status, hrComment: comment || null, decidedAt: new Date() },
+    });
+
+    if (decision === 'APPROVE') {
+      await tx.leaveBalance.update({
+        where: { employeeId_leaveTypeId: { employeeId: leaveRequest.employeeId, leaveTypeId: leaveRequest.leaveTypeId } },
+        data: { remainingDays: { decrement: leaveRequest.days } },
+      });
+    }
+
+    await tx.auditLog.create({
+      data: {
+        userId: req.user.id,
+        action: `LEAVE_HR_${decision}`,
+        module: 'Leave',
+        oldData: leaveRequest,
+        newData: req_,
+      },
+    });
+
+    return req_;
+  });
+
+  await notify(
+    leaveRequest.employee.userId,
+    status === 'REJECTED' ? 'LEAVE_REJECTED' : 'LEAVE_APPROVED',
+    status === 'REJECTED' ? 'Leave request rejected by HR' : 'Leave request fully approved',
+    status === 'REJECTED'
+      ? `HR rejected your leave request. Reason: ${comment || 'No reason given'}`
+      : 'Your leave request has been fully approved and your balance has been updated.'
+  );
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = {
+  listLeaveTypes,
+  createLeaveType,
+  getLeaveBalances,
+  createLeaveRequest,
+  listLeaveRequests,
+  managerReview,
+  hrApprove,
+};
+</file>
+
+<file path="controllers/notification.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const { getPagination } = require("../utils/pagination");
+const { writeAudit } = require("../middleware/audit");
+
+const listNotifications = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const { unreadOnly } = req.query;
+
+  const where = {
+    userId: req.user.id,
+    ...(unreadOnly === "true" ? { read: false } : {}),
+  };
+
+  const [total, notifications] = await Promise.all([
+    prisma.notification.count({ where }),
+    prisma.notification.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: notifications,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+const markRead = asyncHandler(async (req, res) => {
+  const notification = await prisma.notification.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!notification) throw new ApiError(404, "Notification not found");
+  if (notification.userId !== req.user.id)
+    throw new ApiError(403, "Not your notification");
+
+  const updated = await prisma.notification.update({
+    where: { id: notification.id },
+    data: { read: true },
+  });
+  res.json({ success: true, data: updated });
+});
+
+// POST /notifications/broadcast  - HR/Admin sends a notification to all staff or one role
+const broadcastNotification = asyncHandler(async (req, res) => {
+  const { title, message, targetRole } = req.body;
+  if (!title || !message)
+    throw new ApiError(400, "title and message are required");
+  if (
+    targetRole &&
+    !["EMPLOYEE", "MANAGER", "HR", "ADMIN"].includes(targetRole)
+  ) {
+    throw new ApiError(400, "Invalid targetRole");
+  }
+
+  const targetUsers = await prisma.user.findMany({
+    where: {
+      deletedAt: null,
+      isActive: true,
+      ...(targetRole ? { role: targetRole } : {}),
+    },
+    select: { id: true },
+  });
+
+  if (targetUsers.length === 0)
+    throw new ApiError(400, "No matching active users to notify");
+
+  await prisma.notification.createMany({
+    data: targetUsers.map((u) => ({
+      userId: u.id,
+      type: "BROADCAST",
+      title,
+      message,
+    })),
+  });
+
+  const broadcast = await prisma.broadcast.create({
+    data: {
+      title,
+      message,
+      targetRole: targetRole || null,
+      recipientCount: targetUsers.length,
+      sentById: req.user.id,
+    },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "BROADCAST_NOTIFICATION",
+    module: "Notifications",
+    newData: broadcast,
+  });
+
+  res.status(201).json({ success: true, data: broadcast });
+});
+
+// GET /notifications/broadcasts  - HR/Admin broadcast history feed
+const listBroadcasts = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+
+  const [total, broadcasts] = await Promise.all([
+    prisma.broadcast.count(),
+    prisma.broadcast.findMany({
+      skip,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+    }),
+  ]);
+
+  res.json({
+    success: true,
+    data: broadcasts,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+module.exports = {
+  listNotifications,
+  markRead,
+  broadcastNotification,
+  listBroadcasts,
+};
+</file>
+
+<file path="controllers/rbac.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const { getPagination, getSort } = require("../utils/pagination");
+const { writeAudit } = require("../middleware/audit");
+
+// =========================
+// ROLES
+// =========================
+
+// GET /rbac/roles
+const listRoles = asyncHandler(async (req, res) => {
+  const roles = await prisma.rbacRole.findMany({
+    orderBy: { name: "asc" },
+    include: { _count: { select: { permissions: true } } },
+  });
+  res.json({ success: true, data: roles });
+});
+
+// POST /rbac/roles
+const createRole = asyncHandler(async (req, res) => {
+  const { name, description } = req.body;
+  if (!name) throw new ApiError(400, "name is required");
+
+  const role = await prisma.rbacRole.create({
+    data: { name, description: description || null },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "CREATE_ROLE",
+    module: "RBAC",
+    newData: role,
+  });
+
+  res.status(201).json({ success: true, data: role });
+});
+
+// =========================
+// PERMISSIONS
+// =========================
+
+// GET /rbac/permissions  - filterable by module, paginated
+const listPermissions = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ["module", "name", "createdAt"], "module");
+  const { module } = req.query;
+
+  const where = { ...(module ? { module } : {}) };
+
+  const [total, permissions] = await Promise.all([
+    prisma.permission.count({ where }),
+    prisma.permission.findMany({ where, skip, take: limit, orderBy }),
+  ]);
+
+  res.json({
+    success: true,
+    data: permissions,
+    meta: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+// POST /rbac/permissions
+const createPermission = asyncHandler(async (req, res) => {
+  const { name, module, action } = req.body;
+  if (!name || !module || !action)
+    throw new ApiError(400, "name, module and action are required");
+  if (!["CREATE", "READ", "UPDATE", "DELETE"].includes(action))
+    throw new ApiError(400, "action must be CREATE, READ, UPDATE or DELETE");
+
+  const permission = await prisma.permission.create({
+    data: { name, module, action },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "CREATE_PERMISSION",
+    module: "RBAC",
+    newData: permission,
+  });
+
+  res.status(201).json({ success: true, data: permission });
+});
+
+// =========================
+// ROLE <-> PERMISSION ASSIGNMENT
+// =========================
+
+// GET /rbac/roles/:id/permissions  - permission ids currently assigned to a role
+const getRolePermissions = asyncHandler(async (req, res) => {
+  const role = await prisma.rbacRole.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!role) throw new ApiError(404, "Role not found");
+
+  const assignments = await prisma.rbacRolePermission.findMany({
+    where: { roleId: role.id },
+    include: { permission: true },
+  });
+
+  res.json({
+    success: true,
+    data: assignments.map((a) => a.permission),
+  });
+});
+
+// PUT /rbac/roles/:id/permissions  - body: { permissionIds: string[] }
+// Replaces the full assignment set for a role atomically.
+const setRolePermissions = asyncHandler(async (req, res) => {
+  const { permissionIds } = req.body;
+  if (!Array.isArray(permissionIds))
+    throw new ApiError(400, "permissionIds must be an array");
+
+  const role = await prisma.rbacRole.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!role) throw new ApiError(404, "Role not found");
+
+  const before = await prisma.rbacRolePermission.findMany({
+    where: { roleId: role.id },
+    select: { permissionId: true },
+  });
+
+  await prisma.$transaction(async (tx) => {
+    await tx.rbacRolePermission.deleteMany({ where: { roleId: role.id } });
+
+    if (permissionIds.length > 0) {
+      await tx.rbacRolePermission.createMany({
+        data: permissionIds.map((permissionId) => ({
+          roleId: role.id,
+          permissionId,
+        })),
+        skipDuplicates: true,
+      });
+    }
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "SET_ROLE_PERMISSIONS",
+    module: "RBAC",
+    oldData: { permissionIds: before.map((b) => b.permissionId) },
+    newData: { permissionIds },
+  });
+
+  const updated = await prisma.rbacRolePermission.findMany({
+    where: { roleId: role.id },
+    include: { permission: true },
+  });
+
+  res.json({
+    success: true,
+    data: updated.map((a) => a.permission),
+  });
+});
+
+module.exports = {
+  listRoles,
+  createRole,
+  listPermissions,
+  createPermission,
+  getRolePermissions,
+  setRolePermissions,
+};
+</file>
+
+<file path="controllers/review.controller.js">
+const prisma = require("../config/db");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+
+const getEmployeeForUser = async (userId) => {
+  const employee = await prisma.employee.findUnique({ where: { userId } });
+  if (!employee) throw new ApiError(400, "This user has no employee profile");
+  return employee;
+};
+
+const notify = (userId, type, title, message) =>
+  prisma.notification.create({ data: { userId, type, title, message } });
+
+// POST /review-cycles  - HR launches an evaluation period
+
+const createReviewCycle = asyncHandler(async (req, res) => {
+  const { name, startDate, endDate } = req.body;
+  if (!name || !startDate || !endDate)
+    throw new ApiError(400, "name, startDate and endDate are required");
+
+  const cycle = await prisma.reviewCycle.create({
+    data: {
+      name,
+      startDate: new Date(startDate),
+      endDate: new Date(endDate),
+      active: true,
+    },
+  });
+  res.status(201).json({ success: true, data: cycle });
+});
+
+const listReviewCycles = asyncHandler(async (req, res) => {
+  const cycles = await prisma.reviewCycle.findMany({
+    orderBy: { startDate: "desc" },
+    include: { templates: { include: { questions: true } } },
+  });
+  res.json({ success: true, data: cycles });
+});
+
+// POST /review-templates  +  POST /review-templates/:id/questions
+
+const createReviewTemplate = asyncHandler(async (req, res) => {
+  const { cycleId, name } = req.body;
+  if (!cycleId || !name)
+    throw new ApiError(400, "cycleId and name are required");
+
+  const template = await prisma.reviewTemplate.create({
+    data: { cycleId, name },
+  });
+  res.status(201).json({ success: true, data: template });
+});
+
+const addTemplateQuestion = asyncHandler(async (req, res) => {
+  const { category, text, weight = 1 } = req.body;
+  if (!category || !text)
+    throw new ApiError(400, "category and text are required");
+
+  const question = await prisma.reviewQuestion.create({
+    data: { templateId: req.params.id, category, text, weight },
+  });
+  res.status(201).json({ success: true, data: question });
+});
+
+// POST /reviews  - fires one review record for self / peer / manager track
+
+const createReview = asyncHandler(async (req, res) => {
+  const { cycleId, templateId, employeeId, reviewerId, reviewType } = req.body;
+  if (!cycleId || !templateId || !employeeId || !reviewType) {
+    throw new ApiError(
+      400,
+      "cycleId, templateId, employeeId and reviewType are required",
+    );
+  }
+  if (!["SELF", "PEER", "MANAGER"].includes(reviewType))
+    throw new ApiError(400, "Invalid reviewType");
+
+  const review = await prisma.review.create({
+    data: {
+      cycleId,
+      templateId,
+      employeeId,
+      reviewerId: reviewType === "SELF" ? employeeId : reviewerId || null,
+      reviewType,
+      status: "PENDING",
+    },
+  });
+
+  res.status(201).json({ success: true, data: review });
+});
+
+// GET /reviews  - list reviews for current user (as employee or reviewer), or all for HR
+
+const listReviews = asyncHandler(async (req, res) => {
+  const { cycleId, status, employeeId } = req.query;
+  let where = {
+    ...(cycleId ? { cycleId } : {}),
+    ...(status ? { status } : {}),
+  };
+
+  if (["HR", "ADMIN"].includes(req.user.role)) {
+    if (employeeId) where.employeeId = employeeId;
+  } else {
+    const employee = await getEmployeeForUser(req.user.id);
+    where.OR = [{ employeeId: employee.id }, { reviewerId: employee.id }];
+  }
+
+  const reviews = await prisma.review.findMany({
+    where,
+    include: {
+      template: {
+        include: {
+          questions: true,
+        },
+      },
+      employee: { include: { user: { select: { fullName: true } } } },
+      answers: true,
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  res.json({ success: true, data: reviews });
+});
+
+// POST /reviews/:id/answers  - submit answers (bulk) and mark submitted
+// body: { answers: [{ questionId, rating, comment }] }
+
+const submitAnswers = asyncHandler(async (req, res) => {
+  const { answers } = req.body;
+  if (!Array.isArray(answers) || answers.length === 0)
+    throw new ApiError(400, "answers array is required");
+
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+  if (review.status !== "PENDING")
+    throw new ApiError(400, "This review has already been submitted");
+
+  for (const a of answers) {
+    if (!a.questionId || a.rating < 1 || a.rating > 5) {
+      throw new ApiError(
+        400,
+        "Each answer needs a questionId and a rating between 1 and 5",
+      );
+    }
+  }
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.reviewAnswer.createMany({
+      data: answers.map((a) => ({
+        reviewId: review.id,
+        questionId: a.questionId,
+        rating: a.rating,
+        comment: a.comment || null,
+      })),
+    });
+
+    return tx.review.update({
+      where: { id: review.id },
+      data: {
+        status: "SUBMITTED",
+        comments: req.body.comments || null,
+        submittedAt: new Date(),
+      },
+    });
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+// GET /reviews/:id/score  - Score = sum(rating * weight) / sum(weight)
+
+const getScore = asyncHandler(async (req, res) => {
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+    include: { answers: { include: { question: true } } },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+
+  if (review.answers.length === 0) {
+    return res.json({
+      success: true,
+      data: { score: null, message: "No answers submitted yet" },
+    });
+  }
+
+  const weightedSum = review.answers.reduce(
+    (sum, a) => sum + a.rating * Number(a.question.weight),
+    0,
+  );
+  const weightTotal = review.answers.reduce(
+    (sum, a) => sum + Number(a.question.weight),
+    0,
+  );
+  const score = weightTotal > 0 ? weightedSum / weightTotal : null;
+
+  res.json({ success: true, data: { score } });
+});
+
+// PATCH /reviews/:id/publish  - HR locks in the calculated score
+
+const publishReview = asyncHandler(async (req, res) => {
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+    include: { answers: { include: { question: true } }, employee: true },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+  if (review.status !== "SUBMITTED")
+    throw new ApiError(400, "Only submitted reviews can be published");
+
+  const weightedSum = review.answers.reduce(
+    (sum, a) => sum + a.rating * Number(a.question.weight),
+    0,
+  );
+  const weightTotal = review.answers.reduce(
+    (sum, a) => sum + Number(a.question.weight),
+    0,
+  );
+  const overallScore = weightTotal > 0 ? weightedSum / weightTotal : null;
+
+  const updated = await prisma.review.update({
+    where: { id: review.id },
+    data: { status: "PUBLISHED", overallScore },
+  });
+
+  await notify(
+    review.employee.userId,
+    "REVIEW_DUE",
+    "Performance review published",
+    "Your performance review has been published. Please acknowledge it.",
+  );
+
+  res.json({ success: true, data: updated });
+});
+
+// PATCH /reviews/:id/acknowledge  - employee acknowledges the published result
+
+const acknowledgeReview = asyncHandler(async (req, res) => {
+  const review = await prisma.review.findUnique({
+    where: { id: req.params.id },
+    include: { employee: true },
+  });
+  if (!review) throw new ApiError(404, "Review not found");
+  if (review.employee.userId !== req.user.id)
+    throw new ApiError(403, "Only the reviewed employee can acknowledge this");
+  if (review.status !== "PUBLISHED")
+    throw new ApiError(400, "Review has not been published yet");
+
+  const updated = await prisma.review.update({
+    where: { id: review.id },
+    data: { status: "ACKNOWLEDGED", acknowledgedAt: new Date() },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = {
+  createReviewCycle,
+  listReviewCycles,
+  createReviewTemplate,
+  addTemplateQuestion,
+  createReview,
+  listReviews,
+  submitAnswers,
+  getScore,
+  publishReview,
+  acknowledgeReview,
+};
+</file>
+
+<file path="controllers/team.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+const createTeam = asyncHandler(async (req, res) => {
+  const { name, departmentId, leadId } = req.body;
+  if (!name || !departmentId) throw new ApiError(400, 'name and departmentId are required');
+
+  const team = await prisma.team.create({ data: { name, departmentId, leadId: leadId || null } });
+  await writeAudit({ userId: req.user.id, action: 'CREATE_TEAM', module: 'Teams', newData: team });
+  res.status(201).json({ success: true, data: team });
+});
+
+const listTeams = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['name', 'createdAt'], 'name');
+  const { search, departmentId } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(departmentId ? { departmentId } : {}),
+    ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}),
+  };
+
+  const [total, teams] = await Promise.all([
+    prisma.team.count({ where }),
+    prisma.team.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      include: {
+        department: { select: { id: true, name: true } },
+        lead: { select: { id: true, fullName: true } },
+        _count: { select: { employees: true } },
+      },
+    }),
+  ]);
+
+  res.json({ success: true, data: teams, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+const getTeam = asyncHandler(async (req, res) => {
+  const team = await prisma.team.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    include: {
+      department: true,
+      lead: { select: { id: true, fullName: true } },
+      employees: { include: { user: { select: { fullName: true, email: true } } } },
+    },
+  });
+  if (!team) throw new ApiError(404, 'Team not found');
+  res.json({ success: true, data: team });
+});
+
+const updateTeam = asyncHandler(async (req, res) => {
+  const { name, leadId, departmentId } = req.body;
+  const team = await prisma.team.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!team) throw new ApiError(404, 'Team not found');
+
+  const updated = await prisma.team.update({
+    where: { id: team.id },
+    data: {
+      ...(name && { name }),
+      ...(leadId !== undefined && { leadId }),
+      ...(departmentId && { departmentId }),
+    },
+  });
+
+  await writeAudit({ userId: req.user.id, action: 'UPDATE_TEAM', module: 'Teams', oldData: team, newData: updated });
+  res.json({ success: true, data: updated });
+});
+
+const deleteTeam = asyncHandler(async (req, res) => {
+  const team = await prisma.team.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!team) throw new ApiError(404, 'Team not found');
+
+  await prisma.team.update({ where: { id: team.id }, data: { deletedAt: new Date() } });
+  await writeAudit({ userId: req.user.id, action: 'DELETE_TEAM', module: 'Teams', oldData: team });
+
+  res.json({ success: true, message: 'Team removed' });
+});
+
+// GET /teams/:id/attendance  - manager's "team attendance" screen
+const getTeamAttendance = asyncHandler(async (req, res) => {
+  const { date } = req.query;
+  const team = await prisma.team.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!team) throw new ApiError(404, 'Team not found');
+
+  const targetDate = date ? new Date(date) : new Date();
+  targetDate.setUTCHours(0, 0, 0, 0);
+
+  const attendance = await prisma.attendance.findMany({
+    where: { attendanceDate: targetDate, employee: { teamId: team.id } },
+    include: { employee: { include: { user: { select: { fullName: true } } } } },
+  });
+
+  res.json({ success: true, data: attendance });
+});
+
+module.exports = { createTeam, listTeams, getTeam, updateTeam, deleteTeam, getTeamAttendance };
+</file>
+
+<file path="controllers/user.controller.js">
+const prisma = require('../config/db');
+const asyncHandler = require('../utils/asyncHandler');
+const ApiError = require('../utils/ApiError');
+const { getPagination, getSort } = require('../utils/pagination');
+const { writeAudit } = require('../middleware/audit');
+
+// GET /users  - Admin HR directory of raw user accounts RBAC + session mgmt screens
+const listUsers = asyncHandler(async (req, res) => {
+  const { page, limit, skip } = getPagination(req.query);
+  const orderBy = getSort(req.query, ['fullName', 'createdAt'], 'createdAt');
+  const { role, search } = req.query;
+
+  const where = {
+    deletedAt: null,
+    ...(role ? { role } : {}),
+    ...(search
+      ? { OR: [{ fullName: { contains: search, mode: 'insensitive' } }, { email: { contains: search, mode: 'insensitive' } }] }
+      : {}),
+  };
+
+  const [total, users] = await Promise.all([
+    prisma.user.count({ where }),
+    prisma.user.findMany({
+      where,
+      skip,
+      take: limit,
+      orderBy,
+      select: { id: true, email: true, fullName: true, role: true, isActive: true, isVerified: true, lastLogin: true, createdAt: true },
+    }),
+  ]);
+
+  res.json({ success: true, data: users, meta: { page, limit, total, pages: Math.ceil(total / limit) } });
+});
+
+// PATCH /users/:id/status  - Admin activate/deactivate override
+const setUserStatus = asyncHandler(async (req, res) => {
+  const { isActive } = req.body;
+  if (typeof isActive !== 'boolean') throw new ApiError(400, 'isActive must be true or false');
+
+  const user = await prisma.user.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!user) throw new ApiError(404, 'User not found');
+
+  const updated = await prisma.user.update({ where: { id: user.id }, data: { isActive } });
+
+  if (!isActive) {
+    // Deactivation also kills any live sessions immediately.
+    await prisma.session.deleteMany({ where: { userId: user.id } });
+  }
+
+  await writeAudit({
+    userId: req.user.id,
+    action: 'SET_USER_STATUS',
+    module: 'Users',
+    oldData: { isActive: user.isActive },
+    newData: { isActive },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+// PATCH /users/:id/role  - Admin RBAC role change
+const setUserRole = asyncHandler(async (req, res) => {
+  const { role } = req.body;
+  if (!['EMPLOYEE', 'MANAGER', 'HR', 'ADMIN'].includes(role)) throw new ApiError(400, 'Invalid role');
+
+  const user = await prisma.user.findFirst({ where: { id: req.params.id, deletedAt: null } });
+  if (!user) throw new ApiError(404, 'User not found');
+
+  const updated = await prisma.user.update({ where: { id: user.id }, data: { role } });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: 'SET_USER_ROLE',
+    module: 'Users',
+    oldData: { role: user.role },
+    newData: { role },
+  });
+
+  res.json({ success: true, data: updated });
+});
+
+module.exports = { listUsers, setUserStatus, setUserRole };
+</file>
+
+<file path="middleware/audit.js">
+const prisma = require('../config/db');
+
+// Fire-and-forget audit log writer used by controllers after a mutating action.
+const writeAudit = async ({ userId, action, module, oldData, newData }) => {
+  try {
+    await prisma.auditLog.create({
+      data: { userId, action, module, oldData: oldData ?? undefined, newData: newData ?? undefined },
+    });
+  } catch (err) {
+    console.error('Failed to write audit log:', err.message);
+  }
+};
+
+module.exports = { writeAudit };
+</file>
+
+<file path="middleware/auth.js">
+const jwt = require("jsonwebtoken");
+const ApiError = require("../utils/ApiError");
+const prisma = require("../config/db");
+
+// Verifies the access token and attaches the Db user with employee profile to req.user
+const authenticate = async (req, res, next) => {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) throw new ApiError(401, "Access token missing");
+
+    const decoded = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      include: { employee: true },
+    });
+
+    if (!user || user.deletedAt) throw new ApiError(401, "User not found");
+    if (!user.isActive) throw new ApiError(403, "Account has been deactivated");
+
+    req.user = user;
+    next();
+  } catch (err) {
+    if (err instanceof ApiError) return next(err);
+    return next(new ApiError(401, "Invalid or expired access token"));
+  }
+};
+
+// Restricts a route to one or more roles e.g. authorize('HR', 'ADMIN')
+const authorize =
+  (...roles) =>
+  (req, res, next) => {
+    if (!req.user) return next(new ApiError(401, "Not authenticated"));
+
+    const role = (req.user.role || req.user.employee?.role || "").toUpperCase();
+
+    if (!role || !roles.includes(role)) {
+      return next(
+        new ApiError(403, "You do not have permission to perform this action"),
+      );
+    }
+    next();
+  };
+
+module.exports = { authenticate, authorize };
+</file>
+
+<file path="middleware/errorHandler.js">
+const ApiError = require('../utils/ApiError');
+
+// Centralized error handler - every controller throws/forwards errors here
+// instead of building its own response shape.
+const errorHandler = (err, req, res, next) => {
+  if (err instanceof ApiError) {
+    return res.status(err.statusCode).json({ success: false, message: err.message });
+  }
+
+  // Prisma known errors
+  if (err.code === 'P2002') {
+    return res.status(409).json({
+      success: false,
+      message: `A record with this ${err.meta?.target?.join(', ')} already exists`,
+    });
+  }
+  if (err.code === 'P2025') {
+    return res.status(404).json({ success: false, message: 'Record not found' });
+  }
+
+  console.error(err);
+  return res.status(500).json({ success: false, message: 'Internal server error' });
+};
+
+const notFound = (req, res) => {
+  res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found` });
+};
+
+module.exports = { errorHandler, notFound };
+</file>
+
+<file path="middleware/validate.js">
+const ApiError = require('../utils/ApiError');
+
+// Generic Zod validation middleware - fulfils the "strict schema validation on
+// every boundary endpoint" non-functional requirement without a framework.
+const validate = (schema) => (req, res, next) => {
+  const result = schema.safeParse(req.body);
+  if (!result.success) {
+    const message = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join(', ');
+    return next(new ApiError(400, message));
+  }
+  req.body = result.data;
+  next();
+};
+
+module.exports = validate;
+</file>
+
+<file path="routes/attendance.routes.js">
+const router = require('express').Router();
+const attendance = require('../controllers/attendance.controller');
+const { authenticate } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.post('/clock-in', attendance.clockIn);
+router.post('/clock-out', attendance.clockOut);
+router.post('/breaks/start', attendance.startBreak);
+router.post('/breaks/end', attendance.endBreak);
+router.get('/', attendance.listAttendance);
+
+module.exports = router;
+</file>
+
+<file path="routes/audit.routes.js">
+const router = require('express').Router();
+const audit = require('../controllers/audit.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.get('/', authenticate, authorize('HR', 'ADMIN'), audit.listAuditLogs);
+
+module.exports = router;
+</file>
+
+<file path="routes/auth.routes.js">
+const router = require('express').Router();
+const auth = require('../controllers/auth.controller');
+const { authenticate } = require('../middleware/auth');
+
+router.post('/login', auth.login);
+router.post('/activate', auth.activate);
+router.post('/refresh', auth.refresh);
+router.post('/logout', auth.logout);
+router.get('/me', authenticate, auth.me);
+router.get('/sessions', authenticate, auth.listMySessions);
+
+module.exports = router;
+</file>
+
+<file path="routes/department.routes.js">
+const router = require('express').Router();
+const departments = require('../controllers/department.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.get('/', departments.listDepartments);
+router.get('/:id', departments.getDepartment);
+router.post('/', authorize('HR', 'ADMIN'), departments.createDepartment);
+router.put('/:id', authorize('HR', 'ADMIN'), departments.updateDepartment);
+router.delete('/:id', authorize('HR', 'ADMIN'), departments.deleteDepartment);
+
+module.exports = router;
+</file>
+
+<file path="routes/employee.routes.js">
+const router = require("express").Router();
+const employees = require("../controllers/employee.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+console.log("EMPLOYEE ROUTER FILE LOADED");
+router.use(authenticate);
+
+router.post("/onboard", authorize("HR", "ADMIN"), employees.onboardEmployee);
+
+router.get("/", authorize("MANAGER", "HR", "ADMIN"), employees.listEmployees);
+router.get("/:id", employees.getEmployee);
+router.put("/:id", employees.updateEmployee);
+router.delete("/:id", authorize("HR", "ADMIN"), employees.softDeleteEmployee);
+router.post("/:id/documents", employees.addDocument);
+
+module.exports = router;
+</file>
+
+<file path="routes/goal.routes.js">
+const router = require('express').Router();
+const goals = require('../controllers/goal.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.post('/', authorize('MANAGER', 'HR', 'ADMIN'), goals.createGoal);
+router.get('/', goals.listGoals);
+router.get('/:id', goals.getGoal);
+router.patch('/:id/progress', goals.updateProgress);
+router.patch('/:id/validate', authorize('MANAGER', 'HR', 'ADMIN'), goals.validateGoal);
+
+module.exports = router;
+</file>
+
+<file path="routes/hrDashboard.routes.js">
+const router = require("express").Router();
+
+const { authenticate, authorize } = require("../middleware/auth");
+
+const { getHRDashboard } = require("../controllers/hrDashboard.controller");
+
+router.get("/", authenticate, authorize("HR", "ADMIN"), getHRDashboard);
+
+module.exports = router;
+</file>
+
+<file path="routes/index.js">
+const router = require("express").Router();
+
+router.use("/auth", require("./auth.routes"));
+router.use("/sessions", require("./session.routes"));
+router.use("/users", require("./user.routes"));
+router.use("/employees", require("./employee.routes"));
+router.use("/departments", require("./department.routes"));
+router.use("/teams", require("./team.routes"));
+router.use("/attendance", require("./attendance.routes"));
+// leave.routes.js registers /leave-types, /leave-balances, /leave-requests itself
+router.use("/", require("./leave.routes"));
+router.use("/goals", require("./goal.routes"));
+// review.routes.js registers /review-cycles, /review-templates, /reviews itself
+router.use("/", require("./review.routes"));
+router.use("/notifications", require("./notification.routes"));
+router.use("/audit-logs", require("./audit.routes"));
+router.use("/profile", require("./profile.routes"));
+router.use("/hr/dashboard", require("./hrDashboard.routes"));
+router.use("/rbac", require("./rbac.routes"));
+
+module.exports = router;
+</file>
+
+<file path="routes/leave.routes.js">
+const router = require('express').Router();
+const leave = require('../controllers/leave.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.get('/leave-types', leave.listLeaveTypes);
+router.post('/leave-types', authorize('HR', 'ADMIN'), leave.createLeaveType);
+router.get('/leave-balances', leave.getLeaveBalances);
+
+router.post('/leave-requests', leave.createLeaveRequest);
+router.get('/leave-requests', leave.listLeaveRequests);
+router.put('/leave-requests/:id/manager-review', authorize('MANAGER', 'HR', 'ADMIN'), leave.managerReview);
+router.put('/leave-requests/:id/hr-approve', authorize('HR', 'ADMIN'), leave.hrApprove);
+
+module.exports = router;
+</file>
+
+<file path="routes/notification.routes.js">
+const router = require("express").Router();
+const notifications = require("../controllers/notification.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+router.use(authenticate);
+
+router.get("/", notifications.listNotifications);
+router.patch("/:id/read", notifications.markRead);
+
+router.post(
+  "/broadcast",
+  authorize("HR", "ADMIN"),
+  notifications.broadcastNotification,
+);
+router.get(
+  "/broadcasts",
+  authorize("HR", "ADMIN"),
+  notifications.listBroadcasts,
+);
+
+module.exports = router;
+</file>
+
+<file path="routes/profile.routes.js">
+const express = require("express");
+
+const router = express.Router();
+
+const { getMyProfile } = require("../controllers/employee.controller");
+
+const { authenticate } = require("../middleware/auth");
+
+router.get("/me", authenticate, getMyProfile);
+
+module.exports = router;
+</file>
+
+<file path="routes/rbac.routes.js">
+const router = require("express").Router();
+const rbac = require("../controllers/rbac.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+router.use(authenticate);
+router.use(authorize("ADMIN"));
+
+router.get("/roles", rbac.listRoles);
+router.post("/roles", rbac.createRole);
+router.get("/roles/:id/permissions", rbac.getRolePermissions);
+router.put("/roles/:id/permissions", rbac.setRolePermissions);
+
+router.get("/permissions", rbac.listPermissions);
+router.post("/permissions", rbac.createPermission);
+
+module.exports = router;
+</file>
+
+<file path="routes/review.routes.js">
+const router = require("express").Router();
+const reviews = require("../controllers/review.controller");
+const { authenticate, authorize } = require("../middleware/auth");
+
+router.use(authenticate);
+
+router.post(
+  "/review-cycles",
+  authorize("HR", "ADMIN"),
+  reviews.createReviewCycle,
+);
+router.get("/review-cycles", reviews.listReviewCycles);
+router.post(
+  "/review-templates",
+  authorize("HR", "ADMIN"),
+  reviews.createReviewTemplate,
+);
+router.post(
+  "/review-templates/:id/questions",
+  authorize("HR", "ADMIN"),
+  reviews.addTemplateQuestion,
+);
+
+router.post("/reviews", authorize("HR", "ADMIN"), reviews.createReview);
+router.get("/reviews", reviews.listReviews);
+router.post("/reviews/:id/answers", reviews.submitAnswers);
+router.get("/reviews/:id/score", reviews.getScore);
+router.patch(
+  "/reviews/:id/publish",
+  authorize("HR", "ADMIN"),
+  reviews.publishReview,
+);
+router.patch("/reviews/:id/acknowledge", reviews.acknowledgeReview);
+
+module.exports = router;
+</file>
+
+<file path="routes/session.routes.js">
+const router = require('express').Router();
+const auth = require('../controllers/auth.controller');
+const { authenticate } = require('../middleware/auth');
+
+router.delete('/:id', authenticate, auth.revokeSession);
+
+module.exports = router;
+</file>
+
+<file path="routes/team.routes.js">
+const router = require('express').Router();
+const teams = require('../controllers/team.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+
+router.get('/', teams.listTeams);
+router.get('/:id', teams.getTeam);
+router.get('/:id/attendance', authorize('MANAGER', 'HR', 'ADMIN'), teams.getTeamAttendance);
+router.post('/', authorize('HR', 'ADMIN'), teams.createTeam);
+router.put('/:id', authorize('HR', 'ADMIN'), teams.updateTeam);
+router.delete('/:id', authorize('HR', 'ADMIN'), teams.deleteTeam);
+
+module.exports = router;
+</file>
+
+<file path="routes/user.routes.js">
+const router = require('express').Router();
+const users = require('../controllers/user.controller');
+const { authenticate, authorize } = require('../middleware/auth');
+
+router.use(authenticate);
+router.get('/', authorize('HR', 'ADMIN'), users.listUsers);
+router.patch('/:id/status', authorize('ADMIN'), users.setUserStatus);
+router.patch('/:id/role', authorize('ADMIN'), users.setUserRole);
+
+module.exports = router;
+</file>
+
+<file path="utils/ApiError.js">
+class ApiError extends Error {
+  constructor(statusCode, message = 'Something went wrong') {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
+module.exports = ApiError;
+</file>
+
+<file path="utils/asyncHandler.js">
+// Wraps an async route handler so thrown errors go to Express's error middleware
+// instead of crashing the process or needing a try/catch in every controller.
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+module.exports = asyncHandler;
+</file>
+
+<file path="utils/mailer.js">
+const nodemailer = require('nodemailer');
+
+const hasSmtpConfig = () => !!(process.env.SMTP_HOST && process.env.SMTP_USER);
+
+const getTransport = () =>
+  nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT) || 587,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+
+const sendMail = async ({ to, subject, html }) => {
+  if (!hasSmtpConfig()) {
+    console.log(`[mailer] SMTP not configured - would send to ${to}: ${subject}\n${html}`);
+    return;
+  }
+  const transport = getTransport();
+  await transport.sendMail({ from: process.env.SMTP_FROM, to, subject, html });
+};
+
+module.exports = { sendMail };
+</file>
+
+<file path="utils/pagination.js">
+// Shared helper for the "every list endpoint must support pagination,
+// filtering, sorting, search" non-functional requirement.
+const getPagination = (query) => {
+  const page = Math.max(parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(query.limit, 10) || 20, 1), 100);
+  const skip = (page - 1) * limit;
+  return { page, limit, skip };
+};
+
+const getSort = (query, allowedFields = [], fallback = 'createdAt') => {
+  const field = allowedFields.includes(query.sortBy) ? query.sortBy : fallback;
+  const order = query.sortOrder === 'asc' ? 'asc' : 'desc';
+  return { [field]: order };
+};
+
+module.exports = { getPagination, getSort };
+</file>
+
+<file path="utils/tokens.js">
+const jwt = require('jsonwebtoken');
+
+const signAccessToken = (user) =>
+  jwt.sign(
+    { id: user.id, role: user.role, email: user.email },
+    process.env.ACCESS_TOKEN_SECRET,
+    { expiresIn: process.env.ACCESS_TOKEN_EXPIRY || '1d' }
+  );
+
+const signRefreshToken = (user) =>
+  jwt.sign({ id: user.id }, process.env.REFRESH_TOKEN_SECRET, {
+    expiresIn: process.env.REFRESH_TOKEN_EXPIRY || '10d',
+  });
+
+// Converts "10d" / "1d" / "15m" style strings into a millisecond offset for
+// storing Session.expiresAt.
+const expiryToDate = (expiryStr) => {
+  const match = /^(\d+)([smhd])$/.exec(expiryStr || '10d');
+  const [, amountStr, unit] = match || [null, '10', 'd'];
+  const amount = Number(amountStr);
+  const unitMs = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[unit];
+  return new Date(Date.now() + amount * unitMs);
+};
+
+module.exports = { signAccessToken, signRefreshToken, expiryToDate };
+</file>
+
+<file path="app.js">
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
+
+const routes = require('./routes');
+const { errorHandler, notFound } = require('./middleware/errorHandler');
+
+const app = express();
+
+// --- Security hardening (NFR: Helmet, CORS whitelist, rate limiting) -------
+app.use(helmet());
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN === '*' ? true : process.env.CORS_ORIGIN?.split(','),
+    credentials: true,
+  })
+);
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
+
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(morgan('dev'));
+
+app.get('/hrms', (req, res) => res.json({ success: true, message: 'HRMS API is running' }));
+
+app.use('/api/v1', routes);
+
+app.use(notFound);
+app.use(errorHandler);
+
+module.exports = app;
+</file>
+
+<file path="server.js">
+require('dotenv/config');
+const app = require('./app');
+const prisma = require('./config/db');
+
+const PORT = process.env.PORT || 5000;
+
+const start = async () => {
+  try {
+    await prisma.$connect();
+    console.log('Connected to PostgreSQL via Prisma');
+
+    app.listen(PORT, () => {
+      console.log(`HRMS API listening on http://localhost:${PORT}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
+};
+
+start();
+
+process.on('SIGINT', async () => {
+  await prisma.$disconnect();
+  process.exit(0);
+});
+</file>
+
+<file path="testMail.js">
+require("dotenv").config();
+
+const { sendMail } = require("./src/utils/mailer");
+
+const test = async () => {
+  try {
+    await sendMail({
+      to: "loginoptions6@gmail.com",
+      subject: "HRMS SMTP Test",
+      html: `
+                <h1>SMTP Working</h1>
+                <p>Your HRMS email system is connected successfully.</p>
+            `,
+    });
+
+    console.log("Mail sent successfully");
+  } catch (error) {
+    console.log("Mail failed");
+    console.error(error);
+  }
+};
+
+test();
+</file>
+
+</files>
+</file>
+
+<file path="server.js">
+require('dotenv/config');
+const app = require('./app');
+const prisma = require('./config/db');
+
+const PORT = process.env.PORT || 5000;
+
+const start = async () => {
+  try {
+    await prisma.$connect();
+    console.log('Connected to PostgreSQL via Prisma');
+
+    app.listen(PORT, () => {
+      console.log(`HRMS API listening on http://localhost:${PORT}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
+};
+
+start();
+
+process.on('SIGINT', async () => {
+  await prisma.$disconnect();
+  process.exit(0);
+});
+</file>
+
+<file path="testMail.js">
+require("dotenv").config();
+
+const { sendMail } = require("./src/utils/mailer");
+
+const test = async () => {
+  try {
+    await sendMail({
+      to: "loginoptions6@gmail.com",
+      subject: "HRMS SMTP Test",
+      html: `
+                <h1>SMTP Working</h1>
+                <p>Your HRMS email system is connected successfully.</p>
+            `,
+    });
+
+    console.log("Mail sent successfully");
+  } catch (error) {
+    console.log("Mail failed");
+    console.error(error);
+  }
+};
+
+test();
+</file>
+
+</files>
