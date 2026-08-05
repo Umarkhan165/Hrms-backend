@@ -34,7 +34,9 @@ app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 app.use(morgan("dev"));
-
+app.get("/", (req, res) => {
+  res.json({ success: true, message: "HRMS API Serverless Root" });
+});
 app.get("/hrms", (req, res) =>
   res.json({ success: true, message: "HRMS API is running" }),
 );
