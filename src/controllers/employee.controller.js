@@ -52,7 +52,6 @@ const getMyProfile = asyncHandler(async (req, res) => {
 
 // POST /employees/onboard  - HR creates the USERS + EMPLOYEES instance,
 // generates the activation token and emails the invite link.
-
 const onboardEmployee = asyncHandler(async (req, res) => {
   const {
     email,
@@ -149,8 +148,10 @@ const onboardEmployee = asyncHandler(async (req, res) => {
       employeeId: result.employee.id,
     },
   });
+
   const activationLink = `${process.env.CLIENT_URL}/setup?token=${activationToken}`;
 
+  // TRY SENDING EMAIL
   try {
     await sendMail({
       to: email,
@@ -158,49 +159,46 @@ const onboardEmployee = asyncHandler(async (req, res) => {
       subject: "Activate your HRMS Account",
 
       html: `
-  
       <div style="font-family:Arial">
-  
-      <h2>Welcome ${fullName}</h2>
-  
-  
-      <p>
-      Your HRMS account has been created.
-      </p>
-  
-  
-      <p>
-      Click below to activate your account:
-      </p>
-  
-  
-      <a href="${activationLink}"
-      style="
-      background:#2563eb;
-      color:white;
-      padding:12px 20px;
-      text-decoration:none;
-      border-radius:5px;
-      ">
-  
-      Activate Account
-  
-      </a>
-  
-  
-      <p>
-      This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES} minutes.
-      </p>
-  
-  
+        <h2>Welcome ${fullName}</h2>
+        <p>Your HRMS account has been created.</p>
+        <p>Click below to activate your account:</p>
+        <a href="${activationLink}"
+          style="
+          background:#2563eb;
+          color:white;
+          padding:12px 20px;
+          text-decoration:none;
+          border-radius:5px;
+          ">
+          Activate Account
+        </a>
+        <p>
+          This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES || 60} minutes.
+        </p>
       </div>
-  
       `,
     });
   } catch (error) {
     console.error("Onboarding email failed to send:", error.message);
+
+    // ROLLBACK: Delete DB records so account creation is cancelled
+    await prisma.employee.delete({
+      where: { id: result.employee.id },
+    });
+
+    await prisma.user.delete({
+      where: { id: result.user.id },
+    });
+
+    // Send HTTP error response back to frontend
+    throw new ApiError(
+      500,
+      `Failed to send activation email (${error.message}). Onboarding cancelled.`,
+    );
   }
 
+  // ONLY SENT IF EMAIL SUCCESSFUL
   res.status(201).json({
     success: true,
     message: "Employee onboarded successfully - activation email sent",
