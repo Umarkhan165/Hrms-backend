@@ -137,5 +137,31 @@ export const setUserStatus = asyncHandler(async (req, res) => {
     data: deactivatedUser,
   });
 });
+// PATCH /users/:id/role  - Admin RBAC role change
+const setUserRole = asyncHandler(async (req, res) => {
+  const { role } = req.body;
+  if (!["EMPLOYEE", "MANAGER", "HR", "ADMIN"].includes(role))
+    throw new ApiError(400, "Invalid role");
+
+  const user = await prisma.user.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+  });
+  if (!user) throw new ApiError(404, "User not found");
+
+  const updated = await prisma.user.update({
+    where: { id: user.id },
+    data: { role },
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "SET_USER_ROLE",
+    module: "Users",
+    oldData: { role: user.role },
+    newData: { role },
+  });
+
+  res.json({ success: true, data: updated });
+});
 
 module.exports = { listUsers, setUserStatus, setUserRole };
