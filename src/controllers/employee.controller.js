@@ -76,16 +76,21 @@ const onboardEmployee = asyncHandler(async (req, res) => {
     );
   }
 
-  // Validate date format to prevent Prisma parser crashes
+  // Safe parsing to prevent type errors
+  const safeEmail = String(email).toLowerCase().trim();
   const parsedJoiningDate = new Date(joiningDate);
   if (isNaN(parsedJoiningDate.getTime())) {
     throw new ApiError(400, "Invalid joiningDate format");
   }
 
+  let parsedSalary = null;
+  if (salary !== undefined && salary !== null) {
+    parsedSalary = parseFloat(salary);
+    if (isNaN(parsedSalary)) throw new ApiError(400, "Invalid salary format");
+  }
+
   const existing = await prisma.user.findUnique({
-    where: {
-      email: email.toLowerCase().trim(),
-    },
+    where: { email: safeEmail },
   });
 
   if (existing) {
@@ -99,55 +104,86 @@ const onboardEmployee = asyncHandler(async (req, res) => {
     Date.now() + expiryMinutes * 60 * 1000,
   );
 
-  // DB Creation Transaction
-  const result = await prisma.$transaction(async (tx) => {
-    // 1. Create User
-    const user = await tx.user.create({
-      data: {
-        email: email.toLowerCase().trim(),
-        fullName,
-        role,
-        isActive: false,
-        isVerified: false,
-        activationToken,
-        activationTokenExpiry,
-      },
+  let result;
+
+  // Guarded DB Creation Transaction
+  try {
+    result = await prisma.$transaction(async (tx) => {
+      // 1. Create User
+      const user = await tx.user.create({
+        data: {
+          email: safeEmail,
+          fullName,
+          role,
+          isActive: false,
+          isVerified: false,
+          activationToken,
+          activationTokenExpiry,
+        },
+      });
+
+      // 2. Create Employee
+      const employee = await tx.employee.create({
+        data: {
+          userId: user.id,
+          employeeCode,
+          designation,
+          employmentType,
+          salary: parsedSalary,
+          joiningDate: parsedJoiningDate,
+          status: "PENDING",
+          departmentId: departmentId || null,
+          teamId: teamId || null,
+          managerId: managerId || null,
+        },
+      });
+
+      // 3. Create Default Leave Balances
+      // Replaced createMany with Promise.all to support SQLite and edge cases
+      const defaultLeaves = [
+        { leaveType: "CASUAL", allocatedDays: 12, remainingDays: 12 },
+        { leaveType: "SICK", allocatedDays: 10, remainingDays: 10 },
+        { leaveType: "ANNUAL", allocatedDays: 15, remainingDays: 15 },
+      ];
+
+      await Promise.all(
+        defaultLeaves.map((leave) =>
+          tx.leaveBalance.create({
+            data: {
+              employeeId: employee.id,
+              leaveType: leave.leaveType,
+              allocatedDays: leave.allocatedDays,
+              remainingDays: leave.remainingDays,
+            },
+          }),
+        ),
+      );
+
+      return { user, employee };
     });
+  } catch (dbError) {
+    console.error("Database Transaction Error:", dbError);
 
-    // 2. Create Employee
-    const employee = await tx.employee.create({
-      data: {
-        userId: user.id,
-        employeeCode,
-        designation,
-        employmentType,
-        salary: salary ? parseFloat(salary) : null,
-        joiningDate: parsedJoiningDate,
-        status: "PENDING",
-        departmentId: departmentId || null,
-        teamId: teamId || null,
-        managerId: managerId || null,
-      },
-    });
+    if (dbError.code === "P2002") {
+      const target = dbError.meta?.target || "field";
+      throw new ApiError(
+        409,
+        `An employee with this ${target} already exists.`,
+      );
+    }
 
-    // 3. Create Default Leave Balances
-    const defaultLeaves = [
-      { leaveType: "CASUAL", allocatedDays: 12, remainingDays: 12 },
-      { leaveType: "SICK", allocatedDays: 10, remainingDays: 10 },
-      { leaveType: "ANNUAL", allocatedDays: 15, remainingDays: 15 },
-    ];
+    if (dbError.code === "P2003") {
+      throw new ApiError(
+        400,
+        "Invalid reference provided for departmentId, teamId, or managerId.",
+      );
+    }
 
-    await tx.leaveBalance.createMany({
-      data: defaultLeaves.map((leave) => ({
-        employeeId: employee.id,
-        leaveType: leave.leaveType,
-        allocatedDays: leave.allocatedDays,
-        remainingDays: leave.remainingDays,
-      })),
-    });
-
-    return { user, employee };
-  });
+    throw new ApiError(
+      500,
+      `Database error during onboarding: ${dbError.message}`,
+    );
+  }
 
   // Guarded Audit Logging
   try {
@@ -175,7 +211,7 @@ const onboardEmployee = asyncHandler(async (req, res) => {
   try {
     if (typeof sendMail === "function") {
       await sendMail({
-        to: email,
+        to: safeEmail,
         subject: "Activate your HRMS Account",
         html: `
           <div style="font-family: Arial, sans-serif; padding: 20px;">
@@ -210,7 +246,7 @@ const onboardEmployee = asyncHandler(async (req, res) => {
     data: {
       userId: result.user.id,
       employeeId: result.employee.id,
-      ...(!emailSent && { activationToken }), // Provides token in response if email fails
+      ...(!emailSent && { activationToken }),
     },
   });
 });
