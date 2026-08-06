@@ -150,15 +150,14 @@ const onboardEmployee = asyncHandler(async (req, res) => {
         defaultLeaves.map((leave) =>
           tx.leaveBalance.create({
             data: {
-              employee: { connect: { id: employee.id } }, // <-- Fixed relation connection
-              leaveType: leave.leaveType,
+              employee: { connect: { id: employee.id } },
+              leaveType: { connect: { id: leave.leaveType } }, // <-- Connects to the LeaveType relation
               allocatedDays: leave.allocatedDays,
               remainingDays: leave.remainingDays,
             },
           }),
         ),
       );
-
       return { user, employee };
     });
   } catch (dbError) {
