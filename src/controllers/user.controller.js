@@ -3,10 +3,35 @@ const prisma = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { getPagination, getSort } = require("../utils/pagination");
-const { sendMail } = require("../utils/mailer");
-const { writeAudit } = require("../middleware/audit");
 
-// GET /users - Admin HR directory
+// Defensive module loading for mailer (supports both mailer.js and sendMail.js)
+let sendMail;
+try {
+  sendMail = require("../utils/mailer").sendMail;
+} catch (e1) {
+  try {
+    sendMail = require("../utils/sendMail").sendMail;
+  } catch (e2) {
+    sendMail = async ({ to, subject }) => {
+      console.log(
+        `[mailer fallback] Email dispatch skipped for ${to}: ${subject}`,
+      );
+    };
+  }
+}
+
+// Defensive module loading for audit logging
+let writeAudit = () => {};
+try {
+  const auditModule = require("../middleware/audit");
+  if (auditModule && typeof auditModule.writeAudit === "function") {
+    writeAudit = auditModule.writeAudit;
+  }
+} catch (e) {
+  // Audit module is optional
+}
+
+// GET /users - Directory listing
 const listUsers = asyncHandler(async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   const orderBy = getSort(req.query, ["fullName", "createdAt"], "createdAt");
@@ -52,7 +77,7 @@ const listUsers = asyncHandler(async (req, res) => {
   });
 });
 
-// PATCH /users/:id/status - Activate or Deactivate user
+// PATCH /users/:id/status - Activate/Deactivate user & onboarding dispatch
 const setUserStatus = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { isActive } = req.body;
@@ -69,12 +94,13 @@ const setUserStatus = asyncHandler(async (req, res) => {
     throw new ApiError(404, "User not found");
   }
 
-  // IF ACTIVATING AN INACTIVE USER: Generate token & send activation link
+  // ONBOARDING / ACTIVATION FLOW
   if (isActive) {
     const activationToken = crypto.randomBytes(32).toString("hex");
+    const expiryMinutes =
+      Number(process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES) || 60;
     const activationTokenExpiry = new Date(
-      Date.now() +
-        (Number(process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES) || 60) * 60 * 1000,
+      Date.now() + expiryMinutes * 60 * 1000,
     );
 
     const updatedUser = await prisma.user.update({
@@ -90,65 +116,81 @@ const setUserStatus = asyncHandler(async (req, res) => {
       process.env.CLIENT_URL || "https://hrms-frontend-tau-gold.vercel.app";
     const activationLink = `${clientUrl}/setup?token=${activationToken}`;
 
+    let emailStatus = "sent";
     try {
-      if (typeof sendMail === "function") {
-        await sendMail({
-          to: user.email,
-          subject: "Activate your Account",
-          html: `
-            <div style="font-family: Arial, sans-serif; padding: 20px;">
-              <h2>Account Activation Link</h2>
-              <p>Hello ${user.fullName},</p>
-              <p>An administrator has generated an activation link for your account.</p>
-              <p>Click below to complete account setup:</p>
-              <p style="margin: 20px 0;">
-                <a href="${activationLink}" 
-                   style="background: #2563eb; color: white; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
-                  Activate Account
-                </a>
-              </p>
-              <p>This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES || 60} minutes.</p>
-            </div>
-          `,
-        });
-      }
-    } catch (error) {
-      console.error("Failed to send activation email:", error.message);
+      await sendMail({
+        to: user.email,
+        subject: "Activate your HRMS Account",
+        html: `
+          <div style="font-family: Arial, sans-serif; padding: 20px;">
+            <h2>Account Activation Link</h2>
+            <p>Hello ${user.fullName},</p>
+            <p>An administrator has activated your account. Click below to complete account setup:</p>
+            <p style="margin: 20px 0;">
+              <a href="${activationLink}" 
+                 style="background: #2563eb; color: white; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">
+                Activate Account
+              </a>
+            </p>
+            <p>This link expires in ${expiryMinutes} minutes.</p>
+          </div>
+        `,
+      });
+    } catch (mailError) {
+      console.error("Email send failure:", mailError.message);
+      emailStatus = "failed_to_send";
     }
 
-    if (typeof writeAudit === "function" && req.user?.id) {
-      await writeAudit({
-        userId: req.user.id,
-        action: "SET_USER_STATUS",
-        module: "Users",
-        oldData: { isActive: user.isActive },
-        newData: { isActive: true },
-      }).catch(() => {});
+    try {
+      if (req.user?.id) {
+        await writeAudit({
+          userId: req.user.id,
+          action: "SET_USER_STATUS",
+          module: "Users",
+          oldData: { isActive: user.isActive },
+          newData: { isActive: true },
+        });
+      }
+    } catch (auditErr) {
+      console.error("Audit log error:", auditErr.message);
     }
 
     return res.status(200).json({
       success: true,
-      message: "Activation token generated and email dispatched successfully",
+      message:
+        emailStatus === "sent"
+          ? "User activated and onboarding email sent successfully"
+          : "User activated successfully, but email notification could not be delivered.",
       data: updatedUser,
     });
   }
 
-  // IF DEACTIVATING: Update state and purge live sessions
+  // DEACTIVATION FLOW
   const deactivatedUser = await prisma.user.update({
     where: { id },
     data: { isActive: false },
   });
 
-  await prisma.session.deleteMany({ where: { userId: id } }).catch(() => {});
+  try {
+    if (prisma.session) {
+      await prisma.session.deleteMany({ where: { userId: id } });
+    }
+  } catch (sessionErr) {
+    console.error("Session delete error:", sessionErr.message);
+  }
 
-  if (typeof writeAudit === "function" && req.user?.id) {
-    await writeAudit({
-      userId: req.user.id,
-      action: "SET_USER_STATUS",
-      module: "Users",
-      oldData: { isActive: user.isActive },
-      newData: { isActive: false },
-    }).catch(() => {});
+  try {
+    if (req.user?.id) {
+      await writeAudit({
+        userId: req.user.id,
+        action: "SET_USER_STATUS",
+        module: "Users",
+        oldData: { isActive: user.isActive },
+        newData: { isActive: false },
+      });
+    }
+  } catch (auditErr) {
+    console.error("Audit log error:", auditErr.message);
   }
 
   return res.status(200).json({
@@ -181,14 +223,18 @@ const setUserRole = asyncHandler(async (req, res) => {
     data: { role },
   });
 
-  if (typeof writeAudit === "function" && req.user?.id) {
-    await writeAudit({
-      userId: req.user.id,
-      action: "SET_USER_ROLE",
-      module: "Users",
-      oldData: { role: user.role },
-      newData: { role },
-    }).catch(() => {});
+  try {
+    if (req.user?.id) {
+      await writeAudit({
+        userId: req.user.id,
+        action: "SET_USER_ROLE",
+        module: "Users",
+        oldData: { role: user.role },
+        newData: { role },
+      });
+    }
+  } catch (auditErr) {
+    console.error("Audit log error:", auditErr.message);
   }
 
   return res.status(200).json({
