@@ -123,21 +123,36 @@ const onboardEmployee = asyncHandler(async (req, res) => {
       },
     });
 
-    // Automatically grant default leave quotas
+    // Define default leave policy templates
     const defaultPolicies = [
-      { type: "CASUAL", totalDays: 10 },
-      { type: "SICK", totalDays: 8 },
-      { type: "ANNUAL", totalDays: 14 },
+      { name: "Casual Leave", defaultAllocation: 10 },
+      { name: "Sick Leave", defaultAllocation: 8 },
+      { name: "Annual Leave", defaultAllocation: 14 },
     ];
 
-    await tx.leaveBalance.createMany({
-      data: defaultPolicies.map((p) => ({
-        employeeId: employee.id,
-        leaveType: p.type,
-        allocatedDays: p.totalDays,
-        remainingDays: p.totalDays,
-      })),
-    });
+    // Ensure the LeaveType records exist in the DB, then create matching balances
+    for (const policy of defaultPolicies) {
+      let leaveTypeRecord = await tx.leaveType.findUnique({
+        where: { name: policy.name },
+      });
+
+      if (!leaveTypeRecord) {
+        leaveTypeRecord = await tx.leaveType.create({
+          data: {
+            name: policy.name,
+            defaultAllocation: policy.defaultAllocation,
+          },
+        });
+      }
+
+      await tx.leaveBalance.create({
+        data: {
+          employeeId: employee.id,
+          leaveTypeId: leaveTypeRecord.id,
+          remainingDays: leaveTypeRecord.defaultAllocation,
+        },
+      });
+    }
 
     return {
       user,
@@ -199,14 +214,12 @@ const onboardEmployee = asyncHandler(async (req, res) => {
       where: { id: result.user.id },
     });
 
-    // Send HTTP error response back to frontend
     throw new ApiError(
       500,
       `Failed to send activation email (${error.message}). Onboarding cancelled.`,
     );
   }
 
-  // ONLY SENT IF EMAIL SUCCESSFUL
   res.status(201).json({
     success: true,
     message: "Employee onboarded successfully - activation email sent",
