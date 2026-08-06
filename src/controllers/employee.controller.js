@@ -54,6 +54,8 @@ const getMyProfile = asyncHandler(async (req, res) => {
 // generates the activation token and emails the invite link.
 // POST /employees/onboard  - HR creates the USERS + EMPLOYEES instance,
 // generates the activation token and emails the invite link.
+// POST /employees/onboard  - HR creates the USERS + EMPLOYEES instance,
+// generates the activation token and emails the invite link.
 const onboardEmployee = asyncHandler(async (req, res) => {
   const {
     email,
@@ -106,7 +108,7 @@ const onboardEmployee = asyncHandler(async (req, res) => {
 
   let result;
 
-  // Guarded DB Creation Transaction
+  // DB Creation Transaction with LeaveType ID Lookup
   try {
     result = await prisma.$transaction(async (tx) => {
       // 1. Create User
@@ -138,26 +140,38 @@ const onboardEmployee = asyncHandler(async (req, res) => {
         },
       });
 
-      // 3. Create Default Leave Balances
-      // Replaced createMany with Promise.all to support SQLite and edge cases
+      // 3. Fetch Leave Types & Create Default Leave Balances
+      const leaveTypes = await tx.leaveType.findMany();
+
       const defaultLeaves = [
-        { leaveType: "CASUAL", allocatedDays: 12, remainingDays: 12 },
-        { leaveType: "SICK", allocatedDays: 10, remainingDays: 10 },
-        { leaveType: "ANNUAL", allocatedDays: 15, remainingDays: 15 },
+        { name: "CASUAL", allocatedDays: 12, remainingDays: 12 },
+        { name: "SICK", allocatedDays: 10, remainingDays: 10 },
+        { name: "ANNUAL", allocatedDays: 15, remainingDays: 15 },
       ];
 
-      await Promise.all(
-        defaultLeaves.map((leave) =>
-          tx.leaveBalance.create({
+      for (const def of defaultLeaves) {
+        let lt = leaveTypes.find((t) => t.name.toUpperCase() === def.name);
+
+        // Auto-create leave type if missing so onboarding never fails
+        if (!lt) {
+          lt = await tx.leaveType.create({
             data: {
-              employee: { connect: { id: employee.id } },
-              leaveType: { connect: { id: leave.leaveType } }, // <-- Connects to the LeaveType relation
-              allocatedDays: leave.allocatedDays,
-              remainingDays: leave.remainingDays,
+              name: def.name,
+              defaultAllocation: def.allocatedDays,
             },
-          }),
-        ),
-      );
+          });
+        }
+
+        await tx.leaveBalance.create({
+          data: {
+            employeeId: employee.id,
+            leaveTypeId: lt.id,
+            allocatedDays: def.allocatedDays,
+            remainingDays: def.remainingDays,
+          },
+        });
+      }
+
       return { user, employee };
     });
   } catch (dbError) {
