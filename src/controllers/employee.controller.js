@@ -78,21 +78,10 @@ const onboardEmployee = asyncHandler(async (req, res) => {
     );
   }
 
-  // Safe parsing to prevent type errors
-  const safeEmail = String(email).toLowerCase().trim();
-  const parsedJoiningDate = new Date(joiningDate);
-  if (isNaN(parsedJoiningDate.getTime())) {
-    throw new ApiError(400, "Invalid joiningDate format");
-  }
-
-  let parsedSalary = null;
-  if (salary !== undefined && salary !== null) {
-    parsedSalary = parseFloat(salary);
-    if (isNaN(parsedSalary)) throw new ApiError(400, "Invalid salary format");
-  }
-
   const existing = await prisma.user.findUnique({
-    where: { email: safeEmail },
+    where: {
+      email: email.toLowerCase(),
+    },
   });
 
   if (existing) {
@@ -100,166 +89,130 @@ const onboardEmployee = asyncHandler(async (req, res) => {
   }
 
   const activationToken = crypto.randomBytes(32).toString("hex");
-  const expiryMinutes =
-    Number(process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES) || 60;
+
   const activationTokenExpiry = new Date(
-    Date.now() + expiryMinutes * 60 * 1000,
+    Date.now() +
+      (Number(process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES) || 60) * 60 * 1000,
   );
 
-  let result;
-
-  // DB Creation Transaction with LeaveType ID Lookup
-  try {
-    result = await prisma.$transaction(async (tx) => {
-      // 1. Create User
-      const user = await tx.user.create({
-        data: {
-          email: safeEmail,
-          fullName,
-          role,
-          isActive: false,
-          isVerified: false,
-          activationToken,
-          activationTokenExpiry,
-        },
-      });
-
-      // 2. Create Employee
-      const employee = await tx.employee.create({
-        data: {
-          userId: user.id,
-          employeeCode,
-          designation,
-          employmentType,
-          salary: parsedSalary,
-          joiningDate: parsedJoiningDate,
-          status: "PENDING",
-          departmentId: departmentId || null,
-          teamId: teamId || null,
-          managerId: managerId || null,
-        },
-      });
-
-      // 3. Fetch Leave Types & Create Default Leave Balances
-      const leaveTypes = await tx.leaveType.findMany();
-
-      const defaultLeaves = [
-        { name: "CASUAL", allocatedDays: 12, remainingDays: 12 },
-        { name: "SICK", allocatedDays: 10, remainingDays: 10 },
-        { name: "ANNUAL", allocatedDays: 15, remainingDays: 15 },
-      ];
-
-      for (const def of defaultLeaves) {
-        let lt = leaveTypes.find((t) => t.name.toUpperCase() === def.name);
-
-        // Auto-create leave type if missing so onboarding never fails
-        if (!lt) {
-          lt = await tx.leaveType.create({
-            data: {
-              name: def.name,
-              defaultAllocation: def.allocatedDays,
-            },
-          });
-        }
-
-        await tx.leaveBalance.create({
-          data: {
-            employeeId: employee.id,
-            leaveTypeId: lt.id,
-            allocatedDays: def.allocatedDays,
-            remainingDays: def.remainingDays,
-          },
-        });
-      }
-
-      return { user, employee };
+  const result = await prisma.$transaction(async (tx) => {
+    const user = await tx.user.create({
+      data: {
+        email: email.toLowerCase(),
+        fullName,
+        role,
+        isActive: false,
+        isVerified: false,
+        activationToken,
+        activationTokenExpiry,
+      },
     });
-  } catch (dbError) {
-    console.error("Database Transaction Error:", dbError);
 
-    if (dbError.code === "P2002") {
-      const target = dbError.meta?.target || "field";
-      throw new ApiError(
-        409,
-        `An employee with this ${target} already exists.`,
-      );
-    }
+    const employee = await tx.employee.create({
+      data: {
+        userId: user.id,
+        employeeCode,
+        designation,
+        employmentType,
+        salary: salary ?? null,
+        joiningDate: new Date(joiningDate),
+        status: "PENDING",
+        departmentId: departmentId || null,
+        teamId: teamId || null,
+        managerId: managerId || null,
+      },
+    });
 
-    if (dbError.code === "P2003") {
-      throw new ApiError(
-        400,
-        "Invalid reference provided for departmentId, teamId, or managerId.",
-      );
-    }
+    // Automatically grant default leave quotas
+    const defaultPolicies = [
+      { type: "CASUAL", totalDays: 10 },
+      { type: "SICK", totalDays: 8 },
+      { type: "ANNUAL", totalDays: 14 },
+    ];
 
+    await tx.leaveBalance.createMany({
+      data: defaultPolicies.map((p) => ({
+        employeeId: employee.id,
+        leaveType: p.type,
+        allocatedDays: p.totalDays,
+        remainingDays: p.totalDays,
+      })),
+    });
+
+    return {
+      user,
+      employee,
+    };
+  });
+
+  await writeAudit({
+    userId: req.user.id,
+    action: "ONBOARD_EMPLOYEE",
+    module: "Employees",
+    newData: {
+      userId: result.user.id,
+      employeeId: result.employee.id,
+    },
+  });
+
+  const activationLink = `${process.env.CLIENT_URL}/setup?token=${activationToken}`;
+
+  // TRY SENDING EMAIL
+  try {
+    await sendMail({
+      to: email,
+      subject: "Activate your HRMS Account",
+      html: `
+      <div style="font-family:Arial">
+        <h2>Welcome ${fullName}</h2>
+        <p>Your HRMS account has been created.</p>
+        <p>Click below to activate your account:</p>
+        <a href="${activationLink}"
+          style="
+          background:#2563eb;
+          color:white;
+          padding:12px 20px;
+          text-decoration:none;
+          border-radius:5px;
+          ">
+          Activate Account
+        </a>
+        <p>
+          This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES || 60} minutes.
+        </p>
+      </div>
+      `,
+    });
+  } catch (error) {
+    console.error("Onboarding email failed to send:", error.message);
+
+    // ROLLBACK: Delete DB records so account creation and leave balances are cancelled
+    await prisma.leaveBalance.deleteMany({
+      where: { employeeId: result.employee.id },
+    });
+
+    await prisma.employee.delete({
+      where: { id: result.employee.id },
+    });
+
+    await prisma.user.delete({
+      where: { id: result.user.id },
+    });
+
+    // Send HTTP error response back to frontend
     throw new ApiError(
       500,
-      `Database error during onboarding: ${dbError.message}`,
+      `Failed to send activation email (${error.message}). Onboarding cancelled.`,
     );
   }
 
-  // Guarded Audit Logging
-  try {
-    if (typeof writeAudit === "function" && req.user?.id) {
-      await writeAudit({
-        userId: req.user.id,
-        action: "ONBOARD_EMPLOYEE",
-        module: "Employees",
-        newData: {
-          userId: result.user.id,
-          employeeId: result.employee.id,
-        },
-      });
-    }
-  } catch (auditError) {
-    console.error("Audit log error during onboarding:", auditError.message);
-  }
-
-  // Non-blocking Mailer Dispatch
-  const clientUrl =
-    process.env.CLIENT_URL || "https://hrms-frontend-tau-gold.vercel.app";
-  const activationLink = `${clientUrl}/setup?token=${activationToken}`;
-  let emailSent = false;
-
-  try {
-    if (typeof sendMail === "function") {
-      await sendMail({
-        to: safeEmail,
-        subject: "Activate your HRMS Account",
-        html: `
-          <div style="font-family: Arial, sans-serif; padding: 20px;">
-            <h2>Welcome ${fullName}</h2>
-            <p>Your HRMS account has been created.</p>
-            <p>Click below to activate your account:</p>
-            <p style="margin: 20px 0;">
-              <a href="${activationLink}"
-                 style="background: #2563eb; color: white; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">
-                Activate Account
-              </a>
-            </p>
-            <p>This link expires in ${expiryMinutes} minutes.</p>
-          </div>
-        `,
-      });
-      emailSent = true;
-    }
-  } catch (mailError) {
-    console.error(
-      "Onboarding activation email failed to send:",
-      mailError.message,
-    );
-  }
-
-  // Return success response regardless of mail status
-  return res.status(201).json({
+  // ONLY SENT IF EMAIL SUCCESSFUL
+  res.status(201).json({
     success: true,
-    message: emailSent
-      ? "Employee onboarded successfully - activation email sent"
-      : "Employee onboarded successfully (activation email delivery failed - check SMTP setup)",
+    message: "Employee onboarded successfully - activation email sent",
     data: {
       userId: result.user.id,
       employeeId: result.employee.id,
-      ...(!emailSent && { activationToken }),
     },
   });
 });
