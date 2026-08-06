@@ -1,10 +1,12 @@
+const crypto = require("crypto");
 const prisma = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { getPagination, getSort } = require("../utils/pagination");
+const { sendMail } = require("../utils/sendMail");
 const { writeAudit } = require("../middleware/audit");
 
-// GET /users  - Admin HR directory of raw user accounts RBAC + session mgmt screens
+// GET /users - Admin HR directory
 const listUsers = asyncHandler(async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   const orderBy = getSort(req.query, ["fullName", "createdAt"], "createdAt");
@@ -50,63 +52,150 @@ const listUsers = asyncHandler(async (req, res) => {
   });
 });
 
-// PATCH /users/:id/status  - Admin activate/deactivate override
+// PATCH /users/:id/status - Activate or Deactivate user
 const setUserStatus = asyncHandler(async (req, res) => {
+  const { id } = req.params;
   const { isActive } = req.body;
-  if (typeof isActive !== "boolean")
-    throw new ApiError(400, "isActive must be true or false");
 
-  const user = await prisma.user.findFirst({
-    where: { id: req.params.id, deletedAt: null },
-  });
-  if (!user) throw new ApiError(404, "User not found");
-
-  const updated = await prisma.user.update({
-    where: { id: user.id },
-    data: { isActive },
-  });
-
-  if (!isActive) {
-    // Deactivation also kills any live sessions immediately.
-    await prisma.session.deleteMany({ where: { userId: user.id } });
+  if (typeof isActive !== "boolean") {
+    throw new ApiError(400, "isActive boolean state is required");
   }
 
-  await writeAudit({
-    userId: req.user.id,
-    action: "SET_USER_STATUS",
-    module: "Users",
-    oldData: { isActive: user.isActive },
-    newData: { isActive },
+  const user = await prisma.user.findFirst({
+    where: { id, deletedAt: null },
   });
 
-  res.json({ success: true, data: updated });
+  if (!user) {
+    throw new ApiError(404, "User not found");
+  }
+
+  // IF ACTIVATING AN INACTIVE USER: Generate token & send activation link
+  if (isActive) {
+    const activationToken = crypto.randomBytes(32).toString("hex");
+    const activationTokenExpiry = new Date(
+      Date.now() +
+        (Number(process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES) || 60) * 60 * 1000,
+    );
+
+    const updatedUser = await prisma.user.update({
+      where: { id },
+      data: {
+        isActive: true,
+        activationToken,
+        activationTokenExpiry,
+      },
+    });
+
+    const clientUrl =
+      process.env.CLIENT_URL || "https://hrms-frontend-tau-gold.vercel.app";
+    const activationLink = `${clientUrl}/setup?token=${activationToken}`;
+
+    try {
+      if (typeof sendMail === "function") {
+        await sendMail({
+          to: user.email,
+          subject: "Activate your Account",
+          html: `
+            <div style="font-family: Arial, sans-serif; padding: 20px;">
+              <h2>Account Activation Link</h2>
+              <p>Hello ${user.fullName},</p>
+              <p>An administrator has generated an activation link for your account.</p>
+              <p>Click below to complete account setup:</p>
+              <p style="margin: 20px 0;">
+                <a href="${activationLink}" 
+                   style="background: #2563eb; color: white; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                  Activate Account
+                </a>
+              </p>
+              <p>This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES || 60} minutes.</p>
+            </div>
+          `,
+        });
+      }
+    } catch (error) {
+      console.error("Failed to send activation email:", error.message);
+    }
+
+    if (typeof writeAudit === "function" && req.user?.id) {
+      await writeAudit({
+        userId: req.user.id,
+        action: "SET_USER_STATUS",
+        module: "Users",
+        oldData: { isActive: user.isActive },
+        newData: { isActive: true },
+      }).catch(() => {});
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Activation token generated and email dispatched successfully",
+      data: updatedUser,
+    });
+  }
+
+  // IF DEACTIVATING: Update state and purge live sessions
+  const deactivatedUser = await prisma.user.update({
+    where: { id },
+    data: { isActive: false },
+  });
+
+  await prisma.session.deleteMany({ where: { userId: id } }).catch(() => {});
+
+  if (typeof writeAudit === "function" && req.user?.id) {
+    await writeAudit({
+      userId: req.user.id,
+      action: "SET_USER_STATUS",
+      module: "Users",
+      oldData: { isActive: user.isActive },
+      newData: { isActive: false },
+    }).catch(() => {});
+  }
+
+  return res.status(200).json({
+    success: true,
+    message: "User deactivated successfully",
+    data: deactivatedUser,
+  });
 });
 
-// PATCH /users/:id/role  - Admin RBAC role change
+// PATCH /users/:id/role - Admin RBAC role change
 const setUserRole = asyncHandler(async (req, res) => {
+  const { id } = req.params;
   const { role } = req.body;
-  if (!["EMPLOYEE", "MANAGER", "HR", "ADMIN"].includes(role))
-    throw new ApiError(400, "Invalid role");
+
+  const validRoles = ["EMPLOYEE", "MANAGER", "HR", "ADMIN"];
+  if (!role || !validRoles.includes(role)) {
+    throw new ApiError(400, "Invalid role specified");
+  }
 
   const user = await prisma.user.findFirst({
-    where: { id: req.params.id, deletedAt: null },
+    where: { id, deletedAt: null },
   });
-  if (!user) throw new ApiError(404, "User not found");
 
-  const updated = await prisma.user.update({
-    where: { id: user.id },
+  if (!user) {
+    throw new ApiError(404, "User not found");
+  }
+
+  const updatedUser = await prisma.user.update({
+    where: { id },
     data: { role },
   });
 
-  await writeAudit({
-    userId: req.user.id,
-    action: "SET_USER_ROLE",
-    module: "Users",
-    oldData: { role: user.role },
-    newData: { role },
-  });
+  if (typeof writeAudit === "function" && req.user?.id) {
+    await writeAudit({
+      userId: req.user.id,
+      action: "SET_USER_ROLE",
+      module: "Users",
+      oldData: { role: user.role },
+      newData: { role },
+    }).catch(() => {});
+  }
 
-  res.json({ success: true, data: updated });
+  return res.status(200).json({
+    success: true,
+    message: "User role updated successfully",
+    data: updatedUser,
+  });
 });
 
 module.exports = { listUsers, setUserStatus, setUserRole };
