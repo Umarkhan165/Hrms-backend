@@ -1,10 +1,11 @@
+const crypto = require("crypto");
 const prisma = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { getPagination, getSort } = require("../utils/pagination");
-const { writeAudit } = require("../middleware/audit");
+const { sendMail } = require("../utils/sendMail");
 
-// GET /users  - Admin HR directory of raw user accounts RBAC + session mgmt screens
+// GET /users - Admin directory
 const listUsers = asyncHandler(async (req, res) => {
   const { page, limit, skip } = getPagination(req.query);
   const orderBy = getSort(req.query, ["fullName", "createdAt"], "createdAt");
@@ -50,15 +51,8 @@ const listUsers = asyncHandler(async (req, res) => {
   });
 });
 
-// PATCH /users/:id/status  - Admin activate/deactivate override
-import crypto from "crypto";
-import { prisma } from "../config/prisma.js"; // Adjust path to your Prisma client instance
-import { ApiError } from "../utils/ApiError.js";
-import { asyncHandler } from "../utils/asyncHandler.js";
-import { sendMail } from "../utils/sendMail.js";
-
-// PATCH /api/users/:id/status
-export const setUserStatus = asyncHandler(async (req, res) => {
+// PATCH /users/:id/status - Activate or Deactivate user
+const setUserStatus = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { isActive } = req.body;
 
@@ -87,28 +81,32 @@ export const setUserStatus = asyncHandler(async (req, res) => {
       },
     });
 
-    const activationLink = `${process.env.CLIENT_URL}/setup?token=${activationToken}`;
+    const clientUrl =
+      process.env.CLIENT_URL || "https://hrms-frontend-tau-gold.vercel.app";
+    const activationLink = `${clientUrl}/setup?token=${activationToken}`;
 
     try {
-      await sendMail({
-        to: user.email,
-        subject: "Activate your Account",
-        html: `
-          <div style="font-family: Arial, sans-serif; padding: 20px;">
-            <h2>Account Activation Link</h2>
-            <p>Hello ${user.fullName},</p>
-            <p>An administrator has generated an activation link for your account.</p>
-            <p>Click below to complete account setup:</p>
-            <p style="margin: 20px 0;">
-              <a href="${activationLink}" 
-                 style="background: #2563eb; color: white; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
-                Activate Account
-              </a>
-            </p>
-            <p>This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES || 60} minutes.</p>
-          </div>
-        `,
-      });
+      if (typeof sendMail === "function") {
+        await sendMail({
+          to: user.email,
+          subject: "Activate your Account",
+          html: `
+            <div style="font-family: Arial, sans-serif; padding: 20px;">
+              <h2>Account Activation Link</h2>
+              <p>Hello ${user.fullName},</p>
+              <p>An administrator has generated an activation link for your account.</p>
+              <p>Click below to complete account setup:</p>
+              <p style="margin: 20px 0;">
+                <a href="${activationLink}" 
+                   style="background: #2563eb; color: white; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">
+                  Activate Account
+                </a>
+              </p>
+              <p>This link expires in ${process.env.ACTIVATION_TOKEN_EXPIRY_MINUTES || 60} minutes.</p>
+            </div>
+          `,
+        });
+      }
     } catch (error) {
       throw new ApiError(
         500,
@@ -123,7 +121,7 @@ export const setUserStatus = asyncHandler(async (req, res) => {
     });
   }
 
-  // IF DEACTIVATING: Deactivate status and clear active session flags
+  // IF DEACTIVATING
   const deactivatedUser = await prisma.user.update({
     where: { id },
     data: {
@@ -162,6 +160,27 @@ const setUserRole = asyncHandler(async (req, res) => {
   });
 
   res.json({ success: true, data: updated });
+});
+
+// PATCH /users/:id/role
+const setUserRole = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body;
+
+  if (!role) {
+    throw new ApiError(400, "Role is required");
+  }
+
+  const updatedUser = await prisma.user.update({
+    where: { id },
+    data: { role },
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: "User role updated successfully",
+    data: updatedUser,
+  });
 });
 
 module.exports = { listUsers, setUserStatus, setUserRole };
