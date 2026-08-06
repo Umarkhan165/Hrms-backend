@@ -3,7 +3,7 @@ const prisma = require("../config/db");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const { getPagination, getSort } = require("../utils/pagination");
-const { sendMail } = require("../utils/sendMail");
+const { sendMail } = require("../utils/mailer");
 const { writeAudit } = require("../middleware/audit");
 
 // GET /users - Admin HR directory
