@@ -83,6 +83,7 @@ const updateTeam = asyncHandler(async (req, res) => {
   });
   if (!team) throw new ApiError(404, "Team not found");
 
+  // Maps managerId to leadId so Prisma actually updates the database column
   const resolvedLeadId = managerId !== undefined ? managerId : leadId;
 
   const updated = await prisma.team.update({
