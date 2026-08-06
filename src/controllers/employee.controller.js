@@ -52,6 +52,8 @@ const getMyProfile = asyncHandler(async (req, res) => {
 
 // POST /employees/onboard  - HR creates the USERS + EMPLOYEES instance,
 // generates the activation token and emails the invite link.
+// POST /employees/onboard  - HR creates the USERS + EMPLOYEES instance,
+// generates the activation token and emails the invite link.
 const onboardEmployee = asyncHandler(async (req, res) => {
   const {
     email,
@@ -92,42 +94,49 @@ const onboardEmployee = asyncHandler(async (req, res) => {
   );
 
   const result = await prisma.$transaction(async (tx) => {
+    // 1. Create User
     const user = await tx.user.create({
       data: {
         email: email.toLowerCase(),
         fullName,
         role,
-
         isActive: false,
         isVerified: false,
-
         activationToken,
         activationTokenExpiry,
       },
     });
 
+    // 2. Create Employee
     const employee = await tx.employee.create({
       data: {
         userId: user.id,
-
         employeeCode,
-
         designation,
-
         employmentType,
-
         salary: salary ?? null,
-
         joiningDate: new Date(joiningDate),
-
         status: "PENDING",
-
         departmentId: departmentId || null,
-
         teamId: teamId || null,
-
         managerId: managerId || null,
       },
+    });
+
+    // 3. Create Default Leave Balances
+    const defaultLeaves = [
+      { leaveType: "CASUAL", allocatedDays: 12, remainingDays: 12 },
+      { leaveType: "SICK", allocatedDays: 10, remainingDays: 10 },
+      { leaveType: "ANNUAL", allocatedDays: 15, remainingDays: 15 },
+    ];
+
+    await tx.leaveBalance.createMany({
+      data: defaultLeaves.map((leave) => ({
+        employeeId: employee.id,
+        leaveType: leave.leaveType,
+        allocatedDays: leave.allocatedDays,
+        remainingDays: leave.remainingDays,
+      })),
     });
 
     return {
@@ -138,11 +147,8 @@ const onboardEmployee = asyncHandler(async (req, res) => {
 
   await writeAudit({
     userId: req.user.id,
-
     action: "ONBOARD_EMPLOYEE",
-
     module: "Employees",
-
     newData: {
       userId: result.user.id,
       employeeId: result.employee.id,
@@ -155,9 +161,7 @@ const onboardEmployee = asyncHandler(async (req, res) => {
   try {
     await sendMail({
       to: email,
-
       subject: "Activate your HRMS Account",
-
       html: `
       <div style="font-family:Arial">
         <h2>Welcome ${fullName}</h2>
@@ -183,6 +187,10 @@ const onboardEmployee = asyncHandler(async (req, res) => {
     console.error("Onboarding email failed to send:", error.message);
 
     // ROLLBACK: Delete DB records so account creation is cancelled
+    await prisma.leaveBalance.deleteMany({
+      where: { employeeId: result.employee.id },
+    });
+
     await prisma.employee.delete({
       where: { id: result.employee.id },
     });
@@ -191,7 +199,6 @@ const onboardEmployee = asyncHandler(async (req, res) => {
       where: { id: result.user.id },
     });
 
-    // Send HTTP error response back to frontend
     throw new ApiError(
       500,
       `Failed to send activation email (${error.message}). Onboarding cancelled.`,
